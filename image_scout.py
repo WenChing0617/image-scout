@@ -401,6 +401,19 @@ class BigCache:
             self._c.pop(next(iter(self._c)))
         return r
 
+    def peek(self, path: str):
+        """只取缓存里已有的（**任何尺寸**），没有就返回 None —— 绝不重解。
+
+        给滚轮缩放的**快速档**用：连滚时每一格都同步重解码大图（几十到
+        几百毫秒）就是「缩放好卡」的根源。快速档先用缓存里那张顶上
+        （尺寸可能不贴，稍微糊/偏一点），随后防抖一帧按新 zoom 精确重解。
+        """
+        got = self._c.get(path)
+        if got is None:
+            return None
+        self._c[path] = self._c.pop(path)        # 触碰一下，算 LRU
+        return got[1], got[2], got[3]
+
     def drop(self, path: str):
         self._c.pop(path, None)
 
@@ -648,31 +661,15 @@ class App(tk.Tk):
         right = tk.Frame(body, bg=P.PAGE)
         right.pack(side="left", fill="both", expand=True, padx=(S(12), 0))
 
-        # 结论条（**一行压扁**：结论 pill + 主文字 + 副说明同行，tag 靠右。
-        # 2026-10-05 主人反馈「哪怕是全屏，预览区的占比还是太小」——
-        # 结论条从两行压成一行，抠出来的高度全给下面的对比图）
-        vcard = uikit.Card(right, radius=16, pad=S(6))
-        vcard.pack(fill="x")
-        self.verdict_card = vcard
-        v = vcard.body
-        self.verdict_pill = uikit.Pill(v, "—", color=P.TEXT_3,
-                                       bgcolor=P.CARD_SOFT, page=P.CARD)
-        self.verdict_pill.pack(side="left", padx=(S(6), S(10)))
-        self.verdict_text = tk.Label(v, text="等待扫描",
-                                     bg=P.CARD, fg=P.TEXT, font=self.f_h2,
-                                     anchor="w")
-        self.verdict_text.pack(side="left")
-        self.verdict_sub = tk.Label(v, text="左边选一组，这里立刻给出对比",
-                                    bg=P.CARD, fg=P.TEXT_3,
-                                    font=self.f_tiny, anchor="w")
-        self.verdict_sub.pack(side="left", padx=(S(10), 0), pady=(0, S(2)))
-        self.verdict_tag = tk.Label(v, text="", bg=P.CARD, fg=P.TEXT_3,
-                                    font=self.f_small)
-        self.verdict_tag.pack(side="right", padx=(0, S(8)))
-
+        # 结论 + 信息（**合并成一个卡**，2026-10-05 主人：「这两个窗口可以合并」）。
+        # 位置在**预览区下面**（主人订正：信息窗在预览窗下面）——
+        # 第一行是结论（pill + 主文字 + 副说明 + tag 靠右），下面是两列信息。
+        # 行数也压掉了：原来的「工作网格 / 匹配区域 / NIQE 说明」整行去掉，
+        # 质量与清晰度（NIQE）并进「分辨率 · 格式 · 大小 · 时间」那一行 ——
+        # 省出来的每一像素高度都给上面的对比图。
         # 图片对比区（**吃满剩余空间**，这是主角）
         pics = uikit.Card(right, radius=16, pad=S(6), fit=None, height=S(200))
-        pics.pack(fill="both", expand=True, pady=(S(6), 0))
+        pics.pack(fill="both", expand=True)
         self.pics = pics.body
         self.pics.columnconfigure(0, weight=1, uniform="p")
         self.pics.columnconfigure(1, weight=1, uniform="p")
@@ -681,14 +678,36 @@ class App(tk.Tk):
         self.cell_a, self.cv_a, self.cap_a = self._make_pane(self.pics, 0)
         self.cell_b, self.cv_b, self.cap_b = self._make_pane(self.pics, 1)
 
-        # 信息（两列并排、同字段，但压成紧凑几行，把高度让给图片）
-        icard = uikit.Card(right, radius=16, pad=S(7))
+        icard = uikit.Card(right, radius=16, pad=S(6))
         icard.pack(fill="x", pady=(S(6), 0))
         self.info_card = icard
+        self.verdict_card = icard          # 结论行住在信息卡里（同一张卡）
         self.info = icard.body
+        v = self.info
+        vrow = tk.Frame(v, bg=P.CARD)
+        vrow.pack(fill="x")
+        self.verdict_pill = uikit.Pill(vrow, "—", color=P.TEXT_3,
+                                       bgcolor=P.CARD_SOFT, page=P.CARD)
+        self.verdict_pill.pack(side="left", padx=(S(6), S(10)))
+        self.verdict_text = tk.Label(vrow, text="等待扫描",
+                                     bg=P.CARD, fg=P.TEXT, font=self.f_h2,
+                                     anchor="w")
+        self.verdict_text.pack(side="left")
+        self.verdict_sub = tk.Label(vrow, text="左边选一组，这里立刻给出对比",
+                                    bg=P.CARD, fg=P.TEXT_3,
+                                    font=self.f_tiny, anchor="w")
+        self.verdict_sub.pack(side="left", padx=(S(10), 0), pady=(0, S(2)))
+        self.verdict_tag = tk.Label(vrow, text="", bg=P.CARD, fg=P.TEXT_3,
+                                    font=self.f_small)
+        self.verdict_tag.pack(side="right", padx=(0, S(8)))
 
-        # 操作
-        acard = uikit.Card(right, radius=16, pad=S(7))
+        # 两列信息放**独立容器**：Tk 不允许 pack 和 grid 管同一个父容器，
+        # 结论行是 pack 的，信息列要用 grid（两列等宽），只能隔一层。
+        self._info_grid = tk.Frame(self.info, bg=P.CARD)
+        self._info_grid.pack(fill="x")
+
+        # 操作（一行：2026-10-05 主人「按钮可以缩小让其只有一行」）
+        acard = uikit.Card(right, radius=16, pad=S(6))
         acard.pack(fill="x", pady=(S(6), 0))
         self.acts = acard.body
         self._build_actions()
@@ -722,45 +741,46 @@ class App(tk.Tk):
         return cell, cv, cap
 
     def _build_actions(self):
+        """操作按钮：**一行放下**（2026-10-05 主人：「按钮可以缩小让其只有一行」）。
+
+        两行改一行的代价是文字必须变短 —— 「复制 A 到剪贴板」→「复制 A」、
+        「删除 A（移到隔离夹）」→「删除 A」。「移到隔离夹」这句话不用丢：
+        删除的确认框里本来就写着移动目标，删完的 toast 也会再说一遍。
+        """
         a = self.acts
         top = tk.Frame(a, bg=P.CARD)
         top.pack(fill="x")
-        bottom = tk.Frame(a, bg=P.CARD)
-        bottom.pack(fill="x", pady=(S(7), 0))
 
-        def B(master, txt, cmd, kind="soft", gap=(0, S(7)), size=9, **kw):
+        def B(master, txt, cmd, kind="soft", gap=(0, S(5)), **kw):
             b = uikit.RoundButton(master, txt, command=cmd, kind=kind,
-                                  page=P.CARD, size=size, pady=S(6),
-                                  padx=S(14), **kw)
+                                  page=P.CARD, size=9, pady=S(4),
+                                  padx=S(10), **kw)
             b.pack(side="left", padx=gap)
             return b
 
-        self.btn_copy_a = B(top, "复制 A 到剪贴板",
+        self.btn_copy_a = B(top, "复制 A",
                             lambda: self.do_copy_image(self.path_a), "primary",
-                            gap=(S(6), S(7)))
-        self.btn_copy_b = B(top, "复制 B 到剪贴板",
+                            gap=(S(4), S(5)))
+        self.btn_copy_b = B(top, "复制 B",
                             lambda: self.do_copy_image(self.path_b), "primary")
-        B(top, "复制两个文件名", self.copy_names)
-        B(top, "复制完整路径", self.copy_paths)
+        B(top, "复制文件名", self.copy_names)
+        B(top, "复制路径", self.copy_paths)
         B(top, "定位 A", lambda: self._reveal(self.path_a), "ghost")
         B(top, "定位 B", lambda: self._reveal(self.path_b), "ghost")
 
-        self.btn_del_a = B(bottom, "删除 A（移到隔离夹）",
+        self.btn_del_a = B(top, "删除 A",
                            lambda: self.delete_side(0), "danger",
-                           gap=(S(6), S(7)))
-        self.btn_del_b = B(bottom, "删除 B（移到隔离夹）",
+                           gap=(S(10), S(5)))
+        self.btn_del_b = B(top, "删除 B",
                            lambda: self.delete_side(1), "danger")
 
-        self.btn_crop = uikit.RoundButton(bottom, "只看匹配区域",
+        self.btn_zoom = B(top, "重置缩放", self.reset_zoom, "ghost",
+                          gap=(S(10), S(5)))
+        self.btn_crop = uikit.RoundButton(top, "只看匹配区域",
                                           command=self.toggle_crop,
                                           kind="ghost", page=P.CARD, size=9,
-                                          pady=S(6), padx=S(14))
-        self.btn_crop.pack(side="right", padx=(0, S(6)))
-        self.btn_zoom = uikit.RoundButton(bottom, "重置缩放",
-                                          command=self.reset_zoom,
-                                          kind="ghost", page=P.CARD, size=9,
-                                          pady=S(6), padx=S(14))
-        self.btn_zoom.pack(side="right", padx=(0, S(7)))
+                                          pady=S(4), padx=S(10))
+        self.btn_crop.pack(side="left", padx=(0, S(4)))
 
     # ------------------------------------------------------------------
     # 剪贴板
@@ -1402,7 +1422,11 @@ class App(tk.Tk):
             return
         self.zoom[col] = z
         self.pan[col] = [0, 0]        # 只清这一侧的平移
-        self.render_all()
+        # 先用缓存里已有的图立刻响应（绝不同步重解大图 —— 那是「缩放好卡」
+        # 的根源），再防抖 170ms 按新 zoom 精确重解一帧。连滚 N 格只解一次。
+        self.render_all(precise=False, only=col)
+        self._later("zoomhi%d" % col, 170,
+                    lambda c=col: self.render_all(precise=True, only=c))
         self._toast("%s缩放 %.0f%%（滚轮调整，按住可拖动）"
                     % ("" if self.mode != "pair" else ("左" if col == 0 else "右"),
                        z * 100))
@@ -1461,13 +1485,23 @@ class App(tk.Tk):
         self.btn_crop.set_kind("on" if self.crop_only.get() else "ghost")
         self.render_all()
 
-    def render_all(self):
-        self._keep = []
-        self._view = {}
-        self._render_side(0, self.cv_a, self.cap_a, self.path_a, self.rect_a)
-        if self.mode == "pair":
-            self._render_side(1, self.cv_b, self.cap_b, self.path_b,
-                              self.rect_b)
+    def render_all(self, precise=True, only=None):
+        """重渲染对比区。
+
+        `only` 指定只重画某一侧（滚轮只动了一侧时，别把另一侧也白白
+        重新编码一遍）；此时 **不清** `_keep` / `_view`，另一侧的画面原样保留。
+        `precise=False` 是滚轮快速档：只用缓存里已有的解码图顶上，
+        不同步重解 —— 连滚时每格都解大图就是「缩放好卡」的根源。
+        """
+        if only is None:
+            self._keep = []
+            self._view = {}
+        self._render_side(0, self.cv_a, self.cap_a, self.path_a, self.rect_a,
+                          precise)
+        if only is None or only == 1:
+            if self.mode == "pair":
+                self._render_side(1, self.cv_b, self.cap_b, self.path_b,
+                                  self.rect_b, precise)
 
     def _rect_px(self, desc, w, h, rect):
         """工作网格坐标 -> 像素坐标。网格与图同长宽比，按比例放大即可。"""
@@ -1523,7 +1557,7 @@ class App(tk.Tk):
             got = self.big.get(path, need, force=True)
         return got
 
-    def _render_side(self, col, cv, cap, path, rect):
+    def _render_side(self, col, cv, cap, path, rect, precise=True):
         cw = max(1, cv.winfo_width())
         ch = max(1, cv.winfo_height())
         cv.delete("all")
@@ -1547,8 +1581,14 @@ class App(tk.Tk):
         box = (max(16, cw - margin), max(16, ch - margin))
         if crop:
             got = self.big.get(path, self._crop_decode_size(path, desc, rect, box))
-        else:
+        elif precise:
             got = self._decode(path, box[0], box[1], zoom)
+        else:
+            # 快速档：**只用缓存里已有的**，绝不同步重解。
+            # 缓存全空（第一次显示）就保持现有画面，等防抖的精确帧。
+            got = self.big.peek(path)
+            if not got:
+                return
         if not got:
             cv.create_text(cw // 2, ch // 2, text="读不出这张图\n（%s）"
                            % META.of(path)["format"], fill=P.WARN_D,
@@ -1563,11 +1603,18 @@ class App(tk.Tk):
 
         radius = S(PIC_RADIUS) if not crop else S(6)
         if zoom > 1.001 and not crop:
-            # 放大：解码时已经按 zoom 要过更大的图，这里 1:1 贴上去，
-            # 超出的部分由画布自然裁掉，正好可以拖着看局部。
-            img, dw, dh, _ = uikit.fit_photo(
-                self, w, h, bgra, w, h, max_zoom=1e9, radius=radius,
-                page=P.CARD)
+            if precise:
+                # 放大：解码时已经按 zoom 要过更大的图，这里 1:1 贴上去，
+                # 超出的部分由画布自然裁掉，正好可以拖着看局部。
+                img, dw, dh, _ = uikit.fit_photo(
+                    self, w, h, bgra, w, h, max_zoom=1e9, radius=radius,
+                    page=P.CARD)
+            else:
+                # 快速档：缓存图还是上一档的小图，整数放大贴到 zoom 该在的
+                # 位置 —— 像素糊一点，但位置/大小立刻对，防抖后马上换精确帧。
+                img, dw, dh, _ = uikit.fit_photo(
+                    self, w, h, bgra, box[0] * zoom, box[1] * zoom,
+                    max_zoom=8.0, radius=radius, page=P.CARD)
         else:
             img, dw, dh, _ = uikit.fit_photo(
                 self, w, h, bgra, box[0], box[1], max_zoom=MAX_ZOOM,
@@ -1669,29 +1716,30 @@ class App(tk.Tk):
     def _fill_info_impl(self):
         """两图信息**并排对照**，压成紧凑几行（把高度让给图片）。
 
-        每一侧排下去是：标题（文件名）+ 分辨率行 + 「质量 · 清晰度」行 +
-        「工作网格 · 匹配区域 · NIQE 说明」行 + 目录，共 5 行。
-        左右两列的字段顺序完全一致，方便竖着扫一眼比差异；
-        第 3、4 行是**固定拆开**的，不靠自动折行，所以断点不随窗口宽度乱跳。
+        每一侧排下去是：标题（文件名）+ 「分辨率 · 格式 · 大小 · 时间 ·
+        质量 · 清晰度(NIQE)」一行 + 目录，共 3 行。
+        左右两列的字段顺序完全一致，方便竖着扫一眼比差异。
+        2026-10-05 主人：「信息窗口占比太大，第3行的工作网格什么的可以去掉，
+        一行可以显示两行的信息」—— 网格/匹配区域那行整个去掉，
+        质量与 NIQE 并进分辨率那行。
         """
-        for ch in self.info.winfo_children():
+        for ch in self._info_grid.winfo_children():
             ch.destroy()
         # 卡片重建了，旧的「清晰度」标签引用全部作废（算完的结果靠路径比对丢弃）
         self._niqe_lbl = {}
-        self.info.columnconfigure(0, weight=1, uniform="i")
-        self.info.columnconfigure(1, weight=1, uniform="i")
+        self._info_grid.columnconfigure(0, weight=1, uniform="i")
+        self._info_grid.columnconfigure(1, weight=1, uniform="i")
         sides = [(self.path_a, self.rect_a, 0)]
         if self.mode == "pair":
             sides.append((self.path_b, self.rect_b, 1))
         else:
-            self.info.columnconfigure(1, weight=0, uniform="")
+            self._info_grid.columnconfigure(1, weight=0, uniform="")
         for path, rect, col in sides:
-            box = tk.Frame(self.info, bg=P.CARD)
+            box = tk.Frame(self._info_grid, bg=P.CARD)
             box.grid(row=0, column=col, sticky="nsew", padx=S(6))
             if not path:
                 continue
             m = META.of(path)
-            desc = self.descs.get(path)
             wh = m["wh"]
             q = quality_of(wh, m["size"])
 
@@ -1704,47 +1752,29 @@ class App(tk.Tk):
                          fg=P.POOR if q[0] == "poor" else P.TEXT_3,
                          font=self.f_tiny).pack(side="left")
 
+            # 「分辨率 · 格式 · 大小 · 时间 · 质量 · 清晰度」合并成一行。
+            # NIQE 是后台异步算的：先渲染不带它的整行文本（`base`），
+            # 算完由 _niqe_done 把「NIQE 那段」拼回去 —— 所以要把 base 留着。
             f1 = ["分辨率 %s" % (("%d × %d（%.1f MP）"
                                   % (wh[0], wh[1], imgsize.megapixels(wh)))
                                  if wh else "解析不了（%s）" % m["format"]),
                   "%s · %s" % (m["format"], human_size(m["size"])),
-                  human_time(m["mtime"])]
-            tk.Label(box, text=" · ".join(f1), bg=P.CARD, fg=P.TEXT_2,
-                     font=self.f_small, anchor="w", justify="left",
-                     wraplength=S(430)).pack(fill="x")
-
-            # 「质量 + 清晰度」一行、「网格 + 匹配区域」一行 —— 拆成两条**固定**的行。
-            # 原本是一条拼起来的长文本，加了 NIQE 之后必然要折行，而折点跟窗口宽度
-            # 有关，常常把「匹配区域 占本图 26%」甩成孤零零一行。固定拆行后断点是
-            # 确定的，总行数也一样，只是不再看运气。
-            quality = q[1]
+                  human_time(m["mtime"]),
+                  "质量 %s" % q[1]]
+            base = " · ".join(f1)
             nq = self.niqec.cached(path)
-            lbl2 = tk.Label(box, text="质量 %s · %s" % (quality, niqe_field(path, nq)),
-                            bg=P.CARD, fg=P.TEXT_3,
+            lbl2 = tk.Label(box,
+                            text=base if nq is None else
+                            "%s · %s" % (base, niqe_field(path, nq)),
+                            bg=P.CARD, fg=P.TEXT_2,
                             font=self.f_small, anchor="w", justify="left",
-                            wraplength=S(430))
+                            wraplength=S(780))
             lbl2.pack(fill="x")
-            # 回填时要用到「质量」那半句，所以连着它一起记下来
-            self._niqe_lbl[col] = (path, lbl2, quality)
+            # 回填时要用到「质量」那半句和整行模板，一起记下来
+            self._niqe_lbl[col] = (path, lbl2, q[1], base)
             if nq is None:
                 self.niqec.request(path,
                                    lambda p, res, c=col: self._niqe_done(c, p, res))
-            tail = []
-            if desc:
-                tail.append("工作网格 %d × %d" % (desc["gw"], desc["gh"]))
-            if rect and desc:
-                gw, gh = desc["gw"], desc["gh"]
-                ra = (rect[2] - rect[0]) * (rect[3] - rect[1])
-                tail.append("匹配区域 占本图 %.0f%%" % (100.0 * ra / float(gw * gh)))
-            # 这行小字是**必须**说的：NIQE 量的是「离自然图像统计有多远」，
-            # 不是锐度 —— 轻度模糊反而可能让分数更低。不说清楚就成了骗人。
-            # 并进「网格 / 匹配区域」那一行，是为了省一行高度给预览区
-            # （单独占一行会让信息卡多 33px，预览区就少 33px）。
-            tail.append("NIQE 越低越自然（仅同组内可比）")
-            if tail:
-                tk.Label(box, text=" · ".join(tail), bg=P.CARD, fg=P.TEXT_3,
-                         font=self.f_small, anchor="w", justify="left",
-                         wraplength=S(430)).pack(fill="x")
             tk.Label(box, text=m["dir"], bg=P.CARD, fg=P.TEXT_3,
                      font=self.f_tiny, anchor="w", justify="left",
                      wraplength=S(440)).pack(fill="x")
@@ -1754,15 +1784,17 @@ class App(tk.Tk):
 
         只在「这一侧还是当时那张图」时才动它 —— 用户可能已经点到别的图上了，
         那时候旧结果必须丢掉，否则会张冠李戴。
+        行合并后这一行还背着「分辨率 · 格式 · 大小 · 时间 · 质量」，
+        所以要拿存下来的整行模板把文本**整体**重写。
         """
         got = self._niqe_lbl.get(col)
         if not got or got[0] != path:
             return
-        _path, lbl, quality = got
+        _path, lbl, _quality, base = got
         try:
             if not lbl.winfo_exists():
                 return
-            lbl.configure(text="质量 %s · %s" % (quality, niqe_field(path, res)))
+            lbl.configure(text="%s · %s" % (base, niqe_field(path, res)))
         except tk.TclError:
             pass
 

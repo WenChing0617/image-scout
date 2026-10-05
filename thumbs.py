@@ -13,7 +13,26 @@ import zlib
 
 import winimg
 
-__all__ = ["bgra_to_png", "thumb_png", "crop_bgra", "bgra_to_gray"]
+__all__ = ["bgra_to_png", "bgra_to_ppm", "thumb_png", "crop_bgra", "bgra_to_gray"]
+
+
+def bgra_to_ppm(w: int, h: int, bgra: bytes) -> bytes:
+    """BGRA -> PPM(P6) 字节，给大图渲染走**快速通道**。
+
+    为什么不用 PNG：`bgra_to_png` 的大头是 zlib 压缩 —— 一张 3000×3000 的
+    解码图压缩一次要几百毫秒，滚轮缩放每格都来一遍就是「缩放好卡」。
+    P6 是**无压缩**格式：通道分离用扩展切片（C 层 memcpy），Tk 解码 PPM
+    也不需要解压，整条链路快一个量级。代价只是体积大（瞬态内存），
+    喂给 PhotoImage 后就释放了，可以接受。
+
+    通道序同 `bgra_to_png`：源是 B,G,R,A，取 R 用偏移 2、B 用偏移 0。
+    """
+    mv = memoryview(bgra)
+    rgb = bytearray(w * h * 3)
+    rgb[0::3] = mv[2::4]          # R
+    rgb[1::3] = mv[1::4]          # G
+    rgb[2::3] = mv[0::4]          # B
+    return b"P6\n%d %d\n255\n" % (w, h) + bytes(rgb)
 
 
 def bgra_to_png(w: int, h: int, bgra: bytes, level: int = 1) -> bytes:

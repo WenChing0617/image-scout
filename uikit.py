@@ -465,7 +465,10 @@ def fit_photo(root, w, h, bgra, cw, ch, max_zoom=4.0, radius=0, page=None):
         bgra = bytes(round_off_corners(
             Surface.from_bgra(w, h, bgra), radius, page).buf)
     try:
-        img = tk.PhotoImage(data=thumbs.bgra_to_png(w, h, bgra), master=root)
+        # PPM 快速通道（无 zlib 压缩）：大图渲染的耗时大头就是 PNG 编码，
+        # 滚轮缩放每格都来一遍就是「缩放好卡」。视觉结果完全一样
+        # （圆角已经混进 page 底色，不需要 alpha）。
+        img = tk.PhotoImage(data=thumbs.bgra_to_ppm(w, h, bgra), master=root)
     except Exception:
         return None, 0, 0, 1.0
     cw, ch = int(cw), int(ch)

@@ -452,12 +452,12 @@ def main():
           "没有走「缩一半」的兜底路径（%s）" % app.cap_a.dim_lbl.cget("text"))
 
     print("\n=== 预览区够大（其他区域压缩）===")
-    others = (app.info_card.winfo_height() + app.acts.winfo_height()
-              + app.verdict_card.winfo_height())
-    print("   预览区高 %d；信息 %d + 操作 %d + 结论 %d = %d"
-          % (ha, app.info_card.winfo_height(), app.acts.winfo_height(),
-             app.verdict_card.winfo_height(), others))
-    check(ha > others, "预览区比「信息+操作+结论」加起来还高（%d > %d）"
+    # 2026-10-05 主人：「这两个窗口可以合并」—— 结论行并进信息卡了，
+    # 右栏除预览区外就剩「信息卡（含结论行）+ 操作卡」两块。
+    others = app.info_card.winfo_height() + app.acts.winfo_height()
+    print("   预览区高 %d；信息(含结论) %d + 操作 %d = %d"
+          % (ha, app.info_card.winfo_height(), app.acts.winfo_height(), others))
+    check(ha > others, "预览区比「信息+操作」加起来还高（%d > %d）"
           % (ha, others))
     check(ha >= ui.S(200), "预览区高度够大（%d >= %d）" % (ha, ui.S(200)))
 
@@ -586,26 +586,29 @@ def main():
              os.path.basename(calls[1]) if len(calls) > 1 else "?"))
 
     print("\n=== 信息两列并排（同字段对齐）===")
-    cols = app.info.winfo_children()
-    check(len(cols) == 2, "信息区是两列（%d）" % len(cols))
-    txts = [widget_texts(c) for c in cols]
+    # 结论行（pack）+ 两列信息（grid 容器 `_info_grid`）住在同一张卡里
+    box_cols = app._info_grid.winfo_children()
+    check(len(box_cols) == 2, "信息区是两列（%d）" % len(box_cols))
+    txts = [widget_texts(c) for c in box_cols]
     for i, t in enumerate(txts):
         print("   第 %d 列：%s" % (i + 1, " / ".join(x for x in t if x)))
 
     def fields(t):
         s = " ".join(t)
-        return [k for k in ("分辨率", "质量", "清晰度", "工作网格", "匹配区域")
+        return [k for k in ("分辨率", "质量", "清晰度")
                 if k in s]
 
     check(fields(txts[0]) == fields(txts[1]),
           "两列字段一致且顺序一致：%s" % fields(txts[0]))
     check(len(fields(txts[0])) >= 3, "字段没被砍掉（%s）" % fields(txts[0]))
     check("清晰度" in fields(txts[0]), "质量旁边多了一列「清晰度」（NIQE）")
+    # 2026-10-05 主人：「工作网格什么的可以去掉」——这行删了之后，措辞不能再出现
+    all_info = " ".join(" ".join(t) for t in txts)
+    check("工作网格" not in all_info and "匹配区域 占本图" not in all_info,
+          "「工作网格 / 匹配区域」那一行已经去掉")
     ih = int(app.info_card.cget("height"))
-    gh2 = int(app.verdict_card.cget("height"))
     check(ih > ui.S(50), "信息卡高度跟着内容长（%d）" % ih)
     check(ih < ha, "信息卡比预览区矮（%d < %d）—— 高度让给了看图" % (ih, ha))
-    check(gh2 < ih, "结论条更矮（%d < %d）" % (gh2, ih))
 
     print("\n=== NIQE：块数不够就不许给档位 ===")
     # 先验措辞（纯函数，不用等异步）
@@ -646,8 +649,6 @@ def main():
     check(ok and "清晰度" in shown and "计算中" not in shown,
           "信息卡上的「清晰度」被后台算完回填了")
     check("5.73" in shown, "卡片上写的是真算出来的 5.73，不是占位符")
-    check("同组内" in shown,
-          "同一行里写着「NIQE 越低越自然（仅同组内可比）」这句必须说的话")
     app.set_pair(pa, pb)                      # 还原，后面的用例还要用
     app.update()
 
@@ -900,8 +901,7 @@ def main():
         "成员列表": app.mlist,
         "预览A": app.cv_a,
         "预览B": app.cv_b,
-        "结论条": app.verdict_card,
-        "信息卡": app.info_card,
+        "信息卡(含结论行)": app.info_card,
         "操作条": app.acts,
         "状态栏": app.stat,
         "进度条": app.pb,
