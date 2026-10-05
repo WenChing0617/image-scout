@@ -449,6 +449,56 @@ def rounded_png(w, h, bgra, r, page=None):
     return round_off_corners(Surface.from_bgra(w, h, bgra), r, page).png()
 
 
+def fit_img(img, cw, ch, max_zoom=4.0):
+    """把**已经存在的** Tk 图按容器缩放，返回 (图, 显示宽, 显示高)。
+
+    和 `fit_photo` 的区别：这里手上只有 Tk 图对象（拿不回像素），所以只能
+    用 C 层的 `zoom` / `subsample`（都是整数倍）。用途是**占位** ——
+    高清图还在后台编码时，先把上一档的图/缩略图按正确尺寸顶上去，
+    界面立刻有画面，位置大小都对（糊一点而已）。
+    """
+    if img is None:
+        return None, 0, 0
+    w, h = img.width(), img.height()
+    cw, ch = int(max(16, cw)), int(max(16, ch))
+    s = min(cw / float(max(1, w)), ch / float(max(1, h)))
+    s = max(1e-3, min(s, float(max_zoom)))
+    if 0.985 <= s <= 1.015:
+        return img, w, h
+    out = img
+    if s > 1.0:
+        k = max(1, int(s + 0.5))
+        while k > 1 and (w * k > cw or h * k > ch):
+            k -= 1
+        out = out.zoom(k)
+        m = int(round(k / s))
+        if m > 1:
+            out = out.subsample(m)
+    else:
+        m = max(1, int(round(1.0 / s)))
+        out = out.subsample(m)
+        while (out.width() > cw or out.height() > ch) and m < 64:
+            m += 1
+            out = img.subsample(m)
+    return out, out.width(), out.height()
+
+
+def fit_ppm(w, h, bgra, radius=0, page=None):
+    """`fit_photo` 的前半段：**削圆角 + 编码成给 Tk 的字节**，返回 (字节, 宽, 高)。
+
+    单独拆出来是为了**能在后台线程跑**：这一段是纯计算（实测 3600×2400
+    要 145ms，是整个渲染里最贵的一环），放在 UI 线程就是「切一组卡半秒」。
+    剩下来的 `PhotoImage(...)` + 缩放必须回主线程（Tk 只认主线程，而且
+    `zoom`/`subsample` 动的是 Tk 自己的图对象）。
+    """
+    if radius:
+        bgra = bytes(round_off_corners(
+            Surface.from_bgra(w, h, bgra), radius, page).buf)
+    # PPM 快速通道（无 zlib 压缩）：PNG 编码同尺寸要 212ms，PPM 只要 145ms。
+    # 圆角已经混进 page 底色，不需要 alpha。
+    return thumbs.bgra_to_ppm(w, h, bgra), w, h
+
+
 def fit_photo(root, w, h, bgra, cw, ch, max_zoom=4.0, radius=0, page=None):
     """把一张解码好的图缩放着用，返回 (PhotoImage, 显示宽, 显示高, 比例)。
 
@@ -461,14 +511,9 @@ def fit_photo(root, w, h, bgra, cw, ch, max_zoom=4.0, radius=0, page=None):
     * `radius` 不是 0 时会先把四个角削圆（圆角外混成 `page` 底色）再缩放 ——
       只动 4×r² 个像素，跟图多大无关。
     """
-    if radius:
-        bgra = bytes(round_off_corners(
-            Surface.from_bgra(w, h, bgra), radius, page).buf)
     try:
-        # PPM 快速通道（无 zlib 压缩）：大图渲染的耗时大头就是 PNG 编码，
-        # 滚轮缩放每格都来一遍就是「缩放好卡」。视觉结果完全一样
-        # （圆角已经混进 page 底色，不需要 alpha）。
-        img = tk.PhotoImage(data=thumbs.bgra_to_ppm(w, h, bgra), master=root)
+        ppm, w, h = fit_ppm(w, h, bgra, radius, page)
+        img = tk.PhotoImage(data=ppm, master=root)
     except Exception:
         return None, 0, 0, 1.0
     cw, ch = int(cw), int(ch)
@@ -815,6 +860,10 @@ class Card(tk.Canvas):
         self.page = page or Palette.PAGE
         self.shadow = shadow
         self.fit = fit
+        # 只增不减的**最低高度**（见 App._fit_card）：
+        # 卡片高度一变，它下面的预览画布就跟着变，解码尺寸跟着变，
+        # 成品图缓存就整批作废。钉住之后布局才稳定。
+        self.min_h = 0
         self._pad = sc(pad)
         self._inset = sc(2)
         self._last = None
@@ -828,8 +877,19 @@ class Card(tk.Canvas):
         if fit == "height":
             self.body.bind("<Configure>", self._on_body)
 
+    def req_height(self):
+        """**内容本身**请求的高度（不含 `min_h`）。
+
+        必须分开：App 要在「内容高度」上加预留（NIQE 那半句还没落地），
+        再跟 `min_h` 取 max。直接在「已取过 max 的高度」上加预留会**逐次累加**
+        —— 实测一路加到 306px，信息卡吃掉半个窗口。
+        """
+        return self.body.winfo_reqheight() + 2 * (self._pad + self._inset)
+
     def _on_body(self, _e=None):
-        req = self.body.winfo_reqheight() + 2 * (self._pad + self._inset)
+        req = self.req_height()
+        if self.min_h:
+            req = max(req, self.min_h)
         if req < 12:
             return
         try:
@@ -949,8 +1009,14 @@ class NiceList(tk.Canvas):
     def select(self, idx, notify=True):
         if idx == self.sel:
             return
-        self.sel = idx
-        self.redraw()
+        old, self.sel = self.sel, idx
+        # ⚠️ 只重画「旧选中行 + 新选中行」，不是全表重画。
+        #    换选中是**最频繁**的操作（点组、点成员、键盘上下），
+        #    全表重画在几十上百项时是纯浪费。
+        if self.items:
+            self._redraw_rows([old, idx])
+        else:
+            self.redraw()
         if notify and self.on_pick and 0 <= idx < len(self.items):
             self.on_pick(self.items[idx], idx)
 
@@ -978,13 +1044,28 @@ class NiceList(tk.Canvas):
     def _motion(self, ev):
         idx = self._at(ev)
         if idx != self.hover:
-            self.hover = idx
-            self.redraw()
+            old, self.hover = self.hover, idx
+            # ⚠️ 只重画换掉的那两行。原来这里调 `redraw()` 全量重画 ——
+            #    200 项要 10~16ms，而鼠标划过列表一秒能触发几十次，
+            #    实测下来就是「左边窗口上下滑动卡顿」。
+            self._redraw_rows([old, idx])
 
     def _leave(self, _e=None):
         if self.hover != -1:
-            self.hover = -1
-            self.redraw()
+            old, self.hover = self.hover, -1
+            self._redraw_rows([old])
+
+    def _redraw_rows(self, idxs):
+        """只重画指定的几行（删掉它们的图元再画一遍）。"""
+        for i in set(idxs):
+            if 0 <= i < len(self.items):
+                self.delete(self._row_tag(i))
+                self._draw_row(i)
+        # 局部重画不会像 `redraw()` 那样重置 `_refs`，鼠标长时间在列表上划
+        # 会让它无限增长。图本体都在 `_ROW_CACHE` / items 里有强引用，
+        # 这里只丢尾部的冗余引用，不会把正在显示的图回收掉。
+        if len(self._refs) > 4000:
+            self._refs = self._refs[-1000:]
 
     def _wheel(self, ev):
         total = len(self.items) * (self.row_h + self.gap)
@@ -1037,49 +1118,78 @@ class NiceList(tk.Canvas):
         pitch = self.row_h + self.gap
         pad = sc(8)
         mid = self.row_h // 2
-        for i, it in enumerate(self.items):
-            y = i * pitch
-            if i == self.sel:
-                bg = self._rowbg(W - sc(2), "sel")
-                self._refs.append(bg)
-                self.create_image(sc(1), y, anchor="nw", image=bg)
-            elif i == self.hover:
-                bg = self._rowbg(W - sc(2), "hover")
-                self._refs.append(bg)
-                self.create_image(sc(1), y, anchor="nw", image=bg)
-            tx = pad + sc(2)
-            ph = it.get("photo")
-            if ph is not None:
-                self._refs.append(ph)
-                self.create_image(pad + sc(2), y + mid, anchor="w", image=ph)
-                tx = pad + sc(2) + self.thumb + sc(10)
-            # 行尾徽章先量出来，好给标题留出宽度，免得字压到徽章上
-            badge_w = 0
-            badge = it.get("badge")
-            if badge:
-                tone_b = it.get("badge_tone") or it.get("tone", "normal")
-                col = {"poor": Palette.POOR, "loose": Palette.WARN_D,
-                       "strong": Palette.PRIMARY_D}.get(tone_b, Palette.TEXT_2)
-                bimg, bw, bh = self._badge(badge, col,
-                                           mix(col, "#ffffff", 0.86))
-                self._refs.append(bimg)
-                self.create_image(W - pad - bw, y + mid - bh // 2,
-                                  anchor="nw", image=bimg)
-                self.create_text(W - pad - bw // 2, y + mid, text=badge,
-                                 fill=col, font=self.f_s)
-                badge_w = bw + sc(10)
-            tone = it.get("tone", "normal")
-            fg = {"strong": Palette.PRIMARY_D, "loose": Palette.WARN_D,
-                  "poor": Palette.POOR, "match": Palette.MATCH}.get(
-                      tone, Palette.TEXT)
-            self.create_text(tx, y + mid - sc(9), text=it["title"],
-                             anchor="w", fill=fg,
-                             font=self.f_tb if i == self.sel else self.f_t,
-                             width=max(sc(40), W - tx - badge_w - pad))
-            sub = it.get("sub") or ""
-            if sub:
-                self.create_text(tx, y + mid + sc(9), text=sub,
-                                 anchor="w", fill=Palette.TEXT_3,
-                                 font=self.f_s,
-                                 width=max(sc(40), W - tx - badge_w - pad))
+        for i in range(len(self.items)):
+            self._draw_row(i, W, pitch, pad, mid)
+        self.configure(scrollregion=(0, 0, W, len(self.items) * pitch))
+
+    def _row_tag(self, i):
+        return "row%d" % i
+
+    def _draw_row(self, i, W=None, pitch=None, pad=None, mid=None):
+        """画第 i 行（图元都带 `row{i}` 标签，好单独删）。
+
+        拆出来是为了 hover：鼠标在列表上划过时，原来每换一行就**全部重画**
+        （200 项实测 10~16ms，而鼠标移动事件一秒几十次 → 界面掉帧）。
+        现在只删掉受影响的那两行、重画那两行。
+        """
+        if W is None:
+            W = max(40, self.winfo_width())
+        if pitch is None:
+            pitch = self.row_h + self.gap
+        if pad is None:
+            pad = sc(8)
+        if mid is None:
+            mid = self.row_h // 2
+        it = self.items[i]
+        tag = self._row_tag(i)
+        y = i * pitch
+        # ⚠️ 背景和内容必须是两个**独立**的 if。
+        #    之前把内容整段写进了 `elif i == self.hover:` 里，
+        #    结果「既没选中也没悬停」的普通行什么都不画 —— 左栏只剩一排空背景块。
+        if i == self.sel:
+            bg = self._rowbg(W - sc(2), "sel")
+            self._refs.append(bg)
+            self.create_image(sc(1), y, anchor="nw", image=bg, tags=tag)
+        elif i == self.hover:
+            bg = self._rowbg(W - sc(2), "hover")
+            self._refs.append(bg)
+            self.create_image(sc(1), y, anchor="nw", image=bg, tags=tag)
+        # ---- 文字/预览/徽章：每一行都要画 ----
+        tx = pad + sc(2)
+        ph = it.get("photo")
+        if ph is not None:
+            self._refs.append(ph)
+            self.create_image(pad + sc(2), y + mid, anchor="w", image=ph,
+                              tags=tag)
+            tx = pad + sc(2) + self.thumb + sc(10)
+        # 行尾徽章先量出来，好给标题留出宽度，免得字压到徽章上
+        badge_w = 0
+        badge = it.get("badge")
+        if badge:
+            tone_b = it.get("badge_tone") or it.get("tone", "normal")
+            col = {"poor": Palette.POOR, "loose": Palette.WARN_D,
+                   "strong": Palette.PRIMARY_D}.get(tone_b, Palette.TEXT_2)
+            bimg, bw, bh = self._badge(badge, col, mix(col, "#ffffff", 0.86))
+            self._refs.append(bimg)
+            self.create_image(W - pad - bw, y + mid - bh // 2,
+                              anchor="nw", image=bimg, tags=tag)
+            self.create_text(W - pad - bw // 2, y + mid, text=badge,
+                             fill=col, font=self.f_s, tags=tag)
+            badge_w = bw + sc(10)
+        tone = it.get("tone", "normal")
+        fg = {"strong": Palette.PRIMARY_D, "loose": Palette.WARN_D,
+              "poor": Palette.POOR, "match": Palette.MATCH}.get(
+                  tone, Palette.TEXT)
+        self.create_text(tx, y + mid - sc(9), text=it["title"],
+                         anchor="w", fill=fg,
+                         font=self.f_tb if i == self.sel else self.f_t,
+                         width=max(sc(40), W - tx - badge_w - pad),
+                         tags=tag)
+        sub = it.get("sub") or ""
+        if sub:
+            self.create_text(tx, y + mid + sc(9), text=sub,
+                             anchor="w", fill=Palette.TEXT_3,
+                             font=self.f_s,
+                             width=max(sc(40), W - tx - badge_w - pad),
+                             tags=tag)
         self.configure(scrollregion=(0, 0, W, len(self.items) * pitch))

@@ -122,6 +122,18 @@ def canvas_items(cv):
     return kinds, boxes
 
 
+def row_texts(lst, i):
+    """第 i 行的所有文字图元（按 `row{i}` 标签找）。"""
+    out = []
+    for cid in lst.find_withtag(lst._row_tag(i)):
+        if lst.type(cid) == "text":
+            try:
+                out.append(lst.itemcget(cid, "text"))
+            except tk.TclError:
+                pass
+    return out
+
+
 def shown_pct(cv):
     """图片在格子里占了多大（长边方向）—— 用来验「尽可能放大」。"""
     _, boxes = canvas_items(cv)
@@ -141,6 +153,11 @@ def settle_render(app, timeout=6.0):
     判据是「画布尺寸 == 这次渲染记录的尺寸」且图元完整装在画布里。
     """
     def ok():
+        # ⚠️ 高清图是**后台编码**的（不然切一组要卡半秒）。不等它回来就量，
+        #    量到的是占位图 —— 占位图也能满足「画了图」「没溢出」，
+        #    于是「放大后真的解了更大的图」这类断言变成**假绿**。
+        if app._fit_pend:
+            return False
         for col, cv in ((0, app.cv_a), (1, app.cv_b)):
             v = app._view.get(col)
             if not v:
@@ -417,6 +434,38 @@ def main():
           "成员列表每一项都带小预览")
     print("   分组：%s" % " | ".join(it["title"] for it in app.glist.items[:4]))
     print("   成员：%s" % " | ".join(it["title"] for it in app.mlist.items[:4]))
+
+    print("\n=== 每一行都真的画出了文字（回归）===")
+    # 2026-10-05 踩的坑：为做 hover 局部重绘把 `redraw()` 拆出 `_draw_row()` 时，
+    # 把「标题/副标题/徽章」整段塞进了 `elif i == self.hover:` 分支里 ——
+    # 于是**既没选中也没悬停**的行什么都不画，左栏只剩一排空背景块。
+    # 只断言「画布上有 text 图元」会漏：选中行那一行照样能画出字。
+    # 所以必须**逐行**断言：每一行都得有自己那张 title。
+    for lst, nm in ((app.glist, "分组"), (app.mlist, "成员")):
+        blank = [i for i in range(len(lst.items))
+                 if lst.items[i]["title"] not in " ".join(row_texts(lst, i))]
+        check(not blank,
+              "%s列表每一行都有文字（缺字的行：%s）"
+              % (nm, blank[:6] or "无"))
+        kinds = set(lst.type(c) for c in lst.find_all())
+        check("text" in kinds,
+              "%s列表画布上有文字图元（实际类型 %s）" % (nm, sorted(kinds)))
+    # 每个「行标签」下的图元数应该 >1（背景 + 至少一行字）
+    thin = [i for i in range(len(app.glist.items))
+            if len(app.glist.find_withtag(app.glist._row_tag(i))) < 2]
+    check(not thin, "没有「只有背景没有字」的空行（%s）" % (thin[:6] or "无"))
+
+    print("\n=== hover 局部重绘后文字还在 ===")
+    # 局部重绘 = 先 delete(row{i}) 再 _draw_row(i)。要是 delete 把刚画的也删了，
+    # 划过之后行就空了 —— 上面那条测的是**初始**状态，这条测的是**划过之后**。
+    lst = app.glist
+    for i in (0, 1, 2, 3):
+        lst._motion(type("E", (), {"y": int(i * (lst.row_h + lst.gap)) + 4})())
+    lst._leave()
+    after = [i for i in range(len(lst.items))
+             if lst.items[i]["title"] not in " ".join(row_texts(lst, i))]
+    check(not after, "划过若干行 + 移出列表后，文字仍然完整（缺字 %s）"
+          % (after[:6] or "无"))
 
     print("\n=== 左栏比例：分组大、成员小 ===")
     app.update_idletasks()
@@ -889,6 +938,73 @@ def main():
         okc = False
     print("   剪贴板可用：%s" % okc)
     print("   界面提示：%s" % app.clip_hint["text"][:70])
+
+    print("\n=== 流畅度（主线程阻塞耗时）===")
+    # 主人 2026-10-05：「缩放仍然卡顿，在左边窗口上下滑动，选择组合时也会卡顿」。
+    # 光看代码猜不出卡在哪，所以这里直接量：每一次操作把主线程占住多久。
+    # 判据：>100ms 人就能感觉到「顿一下」，>16ms 就凑不满 60fps。
+    app.set_view("groups")
+    app.update()
+    settle_render(app)
+
+    class _Ev(object):
+        """假事件对象（hover 只用 y，滚轮只用 delta）。"""
+
+        def __init__(self, y=0, delta=0):
+            self.x = 10
+            self.y = y
+            self.delta = delta
+
+    lst = app.glist
+    pitch = lst.row_h + lst.gap
+    ngrp = min(len(app.groups), 6)
+
+    # --- 选组 ---
+    for gi in range(ngrp):                      # 先走一遍预热（首遍要解码）
+        lst.select(gi)
+        app.update()
+    settle_render(app)
+    sel_ms = []
+    for gi in range(ngrp):
+        t0 = time.perf_counter()
+        lst.select(gi)
+        app.update()                            # 把这次操作触发的绘制真正跑完
+        sel_ms.append((time.perf_counter() - t0) * 1000)
+        settle_render(app)                      # 高清后台补帧不计入
+    worst_sel = max(sel_ms)
+    print("   选一组（缓存命中）每次 %.0f~%.0f ms"
+          % (min(sel_ms), worst_sel))
+    check(worst_sel < 150,
+          "选一组不卡（最慢 %.0f ms < 150 ms）" % worst_sel)
+
+    # --- 鼠标在列表上划（hover 局部重绘）---
+    t0 = time.perf_counter()
+    for k in range(40):
+        lst._motion(_Ev((k % 5) * pitch + 4))
+        app.update()
+    hv = (time.perf_counter() - t0) * 1000 / 40.0
+    print("   hover 换一行 %.2f ms/次" % hv)
+    check(hv < 8, "鼠标划过列表不掉帧（%.2f ms/次 < 8 ms）" % hv)
+
+    # --- 列表滚动 ---
+    t0 = time.perf_counter()
+    for k in range(40):
+        lst.yview_scroll(1 if k % 8 else -3, "units")
+        app.update()
+    sc = (time.perf_counter() - t0) * 1000 / 40.0
+    print("   列表滚动 %.2f ms/次" % sc)
+    check(sc < 8, "左栏上下滑动不卡（%.2f ms/次 < 8 ms）" % sc)
+    lst.yview_moveto(0.0)
+
+    # --- 滚轮缩放（先响应后精解，主线程只该占很短）---
+    t0 = time.perf_counter()
+    for k in range(12):
+        app._on_wheel(0, _Ev(delta=120 if k % 2 else -120))
+        app.update()
+    zm = (time.perf_counter() - t0) * 1000 / 12.0
+    print("   滚轮缩放 %.2f ms/次（高清帧在后台补，不计入）" % zm)
+    check(zm < 60, "滚轮缩放跟手（%.2f ms/次 < 60 ms）" % zm)
+    settle_render(app)
 
     print("\n=== 布局几何体检 ===")
     print("   这里量的是各控件的实际坐标与尺寸（像素级断言，比肉眼看截图更硬）：")

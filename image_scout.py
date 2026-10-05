@@ -377,11 +377,44 @@ class BigCache:
     于是又得让 Tk 的 `subsample` 兜底缩一次 —— 白解一遍大图，画质还多损一道。
     这里改成「需求落在已缓存的 1.15 倍以内就复用，否则重解」，
     解码尺寸始终贴着真实需求走。
+
+    ⚠️ 除了 BGRA 还缓存 **`PhotoImage`**（`_p`），这是 2026-10-05 修「选一组卡
+    672ms」的关键：实测 3600×2400 的图，**编码成给 Tk 的字节要 145ms、Tk 再
+    解成图要 38ms** —— 也就是说，光「把已经解码好的像素变成 Tk 图」就
+    比解码本身还贵。以前每渲染一次都重做一遍，切回同一组、滚轮回到同一档
+    就白白再付 180ms。现在按 (路径, 需求尺寸, 容器尺寸) 存成品图，
+    命中就直接 `create_image`，只剩 ~40ms 的贴图开销。
     """
+
+    # ⚠️ 别按「个数」淘汰：一张 3600×2400 的 BGRA 是 34MB，一张 400×300 才
+    #    0.5MB。按个数只留 5 个时，在 6 个组之间来回点就**全部被挤掉** ——
+    #    实测选一组还是 82~152ms（看着像没缓存，其实是缓存太小）。
+    #    改成按**字节预算**淘汰：填满预算为止，热的那几张才真的留得住。
+    BYTE_BUDGET = 192 * 1024 * 1024      # 原始像素
+    PHOTO_BUDGET = 256 * 1024 * 1024     # 成品 Tk 图（Tk 那边大约也是 4 字节/px）
 
     def __init__(self, limit: int = 5):
         self._c = {}
-        self.limit = limit
+        self._p = {}
+        self._c_bytes = 0
+        self._p_bytes = 0
+
+    @staticmethod
+    def _psize(img):
+        try:
+            return img.width() * img.height() * 4
+        except Exception:
+            return 0
+
+    def _evict_c(self):
+        while self._c_bytes > self.BYTE_BUDGET and len(self._c) > 1:
+            k = next(iter(self._c))
+            self._c_bytes -= len(self._c.pop(k)[3])
+
+    def _evict_p(self):
+        while self._p_bytes > self.PHOTO_BUDGET and len(self._p) > 1:
+            k = next(iter(self._p))
+            self._p_bytes -= self._psize(self._p.pop(k))
 
     def get(self, path: str, need: int, force: bool = False):
         need = max(64, int(need))
@@ -389,6 +422,8 @@ class BigCache:
         if not force and got is not None and need <= got[0] <= need * 1.15:
             self._c[path] = self._c.pop(path)        # 触碰一下，算 LRU
             return got[1], got[2], got[3]
+        if got is not None:
+            self._c_bytes -= len(got[3])
         # SIIGBF_SCALEUP：允许系统把图放大到我们要的尺寸（不加这个标志它只缩不放）。
         # raw=True：预览不参与指纹，走单次读取，尺寸精确（见 winimg.load_pixels）
         r = winimg.load_pixels(path, need,
@@ -397,8 +432,8 @@ class BigCache:
         if not r:
             return None
         self._c[path] = (need, r[0], r[1], r[2])
-        while len(self._c) > self.limit:
-            self._c.pop(next(iter(self._c)))
+        self._c_bytes += len(r[2])
+        self._evict_c()
         return r
 
     def peek(self, path: str):
@@ -414,8 +449,28 @@ class BigCache:
         self._c[path] = self._c.pop(path)        # 触碰一下，算 LRU
         return got[1], got[2], got[3]
 
+    # ---- 成品 Tk 图（PhotoImage）的缓存 --------------------------------
+    def photo(self, key):
+        """按 (路径, 需求尺寸, 容器宽, 容器高) 取已经做好的 Tk 图。"""
+        got = self._p.get(key)
+        if got is not None:
+            self._p[key] = self._p.pop(key)      # LRU
+        return got
+
+    def put_photo(self, key, img):
+        old = self._p.pop(key, None)
+        if old is not None:
+            self._p_bytes -= self._psize(old)
+        self._p[key] = img
+        self._p_bytes += self._psize(img)
+        self._evict_p()
+
     def drop(self, path: str):
-        self._c.pop(path, None)
+        got = self._c.pop(path, None)
+        if got is not None:
+            self._c_bytes -= len(got[3])
+        for k in [k for k in self._p if k[0] == path]:
+            self._p_bytes -= self._psize(self._p.pop(k))
 
 
 # ---------------------------------------------------------------------------
@@ -486,6 +541,8 @@ class App(tk.Tk):
         self._later_ids = {}
         self._keep = []           # 主预览图的引用
         self._view = {}           # 侧 -> (画布, 图元, 显示宽, 显示高, 画布宽, 画布高)
+        self._fit_pend = {}       # 侧 -> 正在后台编码的那一帧（防重算 / 防张冠李戴）
+        self._info_min_h = 0      # 信息卡被「只增不减」钉住的高度（见 _fit_card）
 
         self.preset_key = scan.DEFAULT_PRESET
         self.recursive_var = tk.BooleanVar(value=True)
@@ -838,12 +895,14 @@ class App(tk.Tk):
         self.pan = [[0, 0], [0, 0]]
         self.thumb = ThumbCache(self)
         self.big = BigCache()
+        self._fit_pend = {}           # 侧 -> 正在后台算的那一帧（防重算/防张冠李戴）
         self._niqe_lbl = {}           # 信息卡里「清晰度」那一段的引用
         self.glist.set_items([])
         self.mlist.set_items([])
         self._sync_view_btns()
-        self._update_verdict(None)
-        self._fill_info()
+        self._update_verdict(None, fit=False)
+        self._fill_info(fit=False)
+        self._fit_card()
         self._apply_grid()
         self.render_all()
         self.stat.configure(text="就绪")
@@ -1100,8 +1159,9 @@ class App(tk.Tk):
             self.path_a = self.path_b = None
             self.mlist.set_items([])
             self.lbl_members.configure(text="本组成员")
-            self._update_verdict(None)
-            self._fill_info()
+            self._update_verdict(None, fit=False)
+            self._fill_info(fit=False)
+            self._fit_card()
             self.render_all()
         self._sync_view_btns()
 
@@ -1149,8 +1209,9 @@ class App(tk.Tk):
             self.path_a = self.path_b = None
             self.mlist.set_items([])
             self.lbl_members.configure(text="与它相似")
-            self._update_verdict(None)
-            self._fill_info()
+            self._update_verdict(None, fit=False)
+            self._fill_info(fit=False)
+            self._fit_card()
             self.render_all()
             self._sync_view_btns()
             return
@@ -1265,8 +1326,9 @@ class App(tk.Tk):
         self.group = self.groups[gi]
         self.gidx = gi
         self._group_mem = gi          # 切走再切回来要认出上次看的是哪一组
-        self.cur_member = None
-        self._fill_member_list()
+        # ⚠️ 原来这里填了**两次**成员表（先 cur_member=None 填一次，
+        #    再设成 order[0] 填一次）—— 两次结果一模一样，等于整表重画两遍。
+        #    先定好 cur_member，只填一次。
         order = self._member_order()
         self.cur_member = order[0] if order else None
         self._fill_member_list()
@@ -1386,8 +1448,10 @@ class App(tk.Tk):
             kind, score, d, i, j = self.pair
             self.rect_a = descs[a]["rects"][i]
             self.rect_b = descs[b]["rects"][j]
-        self._update_verdict(self.pair)
-        self._fill_info()
+        # 同上：结论行与信息卡是同一张，fit 只做一次
+        self._update_verdict(self.pair, fit=False)
+        self._fill_info(fit=False)
+        self._fit_card()
         self.render_all()
 
     def _apply_grid(self):
@@ -1503,6 +1567,64 @@ class App(tk.Tk):
                 self._render_side(1, self.cv_b, self.cap_b, self.path_b,
                                   self.rect_b, precise)
 
+    # ---- 异步出图（把最贵的「编码」挪出主线程）----------------------
+    def _fit_async(self, col, path, key, w, h, bgra, want, radius):
+        """后台把像素编码成给 Tk 的字节，回主线程再做 PhotoImage。
+
+        主线程只留 `PhotoImage` + 贴图（实测 38 + 46ms），
+        最贵的 145ms 编码和 88ms 解码都挪到后台 —— 这就是「切一组不再卡」。
+        """
+        if self._fit_pend.get(col) == key:
+            return                                   # 同一帧已经在算了
+        self._fit_pend[col] = key
+
+        def work():
+            try:
+                ppm, ww, hh = uikit.fit_ppm(w, h, bgra, radius, P.CARD)
+            except Exception:
+                ppm = None
+            # ⚠️ 编码完的字节可能不小（25MB），只在主线程短暂持有
+            self._ui(self._fit_ready, col, path, key, ppm, w, h, want)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _fit_ready(self, col, path, key, ppm, w, h, want):
+        """后台编码回来了 —— 只在这一侧还是同一张图、同一个请求时才用。
+
+        ⚠️ 无论用不用，**都要把这一侧的 pending 清掉**：它是「还有活没干完」
+        的标志（测试也拿它等高清图），一直不清就会永远等下去。
+        """
+        mine = self._fit_pend.get(col) == key
+        cur = self.path_a if col == 0 else self.path_b
+        if mine:
+            self._fit_pend.pop(col, None)
+        if not mine or ppm is None or cur != path:
+            return                       # 过期结果，丢掉（用户已经点走/换了档）
+        try:
+            img = tk.PhotoImage(data=ppm, master=self)
+            img, _dw, _dh = uikit.fit_img(img, want[0], want[1], want[2])
+        except Exception:
+            return
+        self.big.put_photo(key, img)
+        self.render_all(precise=True, only=col)
+
+    def _placeholder(self, col, path, cw, ch):
+        """高清图还没就绪时的占位：先用别的档位/缩略图顶上，别让格子空着。"""
+        src = None
+        for k in self.big._p:
+            if k[0] == path:
+                src = self.big.photo(k)
+                if src is not None:
+                    break
+        if src is None:
+            try:
+                src = self.thumb.get(path, S(200), 0, P.CARD)
+            except Exception:
+                src = None
+        if src is None:
+            return None, 0, 0
+        return uikit.fit_img(src, cw, ch, MAX_ZOOM if MAX_ZOOM > 8 else 8.0)
+
     def _rect_px(self, desc, w, h, rect):
         """工作网格坐标 -> 像素坐标。网格与图同长宽比，按比例放大即可。"""
         gw, gh = desc["gw"], desc["gh"]
@@ -1579,6 +1701,12 @@ class App(tk.Tk):
         # 直接砍掉一半（只超 8px 却缩成 50%，特别冤）。
         margin = S(8)
         box = (max(16, cw - margin), max(16, ch - margin))
+        # ⚠️ box 也要量化（向下取整到 16px），而且**必须先于**解码尺寸的计算。
+        #    只量化下面的 `want` 没用：画布抖 8px -> 解码尺寸 `need` 变 ->
+        #    重新解码 -> 图的 (w,h) 变 -> 成品图 key 里那两个分量还是不一样，
+        #    照样每次选一组都未命中、都要重编码一遍。
+        #    向下取整：解码出来的图只会略小于格子，绝不会溢出被裁。
+        box = (max(16, box[0] // 16 * 16), max(16, box[1] // 16 * 16))
         if crop:
             got = self.big.get(path, self._crop_decode_size(path, desc, rect, box))
         elif precise:
@@ -1602,23 +1730,41 @@ class App(tk.Tk):
             w, h, bgra = thumbs.crop_bgra(w, h, bgra, px[0], px[1], cw0, ch0)
 
         radius = S(PIC_RADIUS) if not crop else S(6)
+        # ⚠️ 先把「这一帧要什么」算出来，再去查成品图缓存：
+        #    把已经解码好的像素变成 Tk 图要 ~180ms（编码 145 + Tk 解码 38），
+        #    比解码本身还贵。命中就直接贴图，切回同一组/滚回同一档不再重付这笔钱。
         if zoom > 1.001 and not crop:
             if precise:
                 # 放大：解码时已经按 zoom 要过更大的图，这里 1:1 贴上去，
                 # 超出的部分由画布自然裁掉，正好可以拖着看局部。
-                img, dw, dh, _ = uikit.fit_photo(
-                    self, w, h, bgra, w, h, max_zoom=1e9, radius=radius,
-                    page=P.CARD)
+                want = (w, h, 1e9)
             else:
                 # 快速档：缓存图还是上一档的小图，整数放大贴到 zoom 该在的
                 # 位置 —— 像素糊一点，但位置/大小立刻对，防抖后马上换精确帧。
-                img, dw, dh, _ = uikit.fit_photo(
-                    self, w, h, bgra, box[0] * zoom, box[1] * zoom,
-                    max_zoom=8.0, radius=radius, page=P.CARD)
+                want = (box[0] * zoom, box[1] * zoom, 8.0)
         else:
-            img, dw, dh, _ = uikit.fit_photo(
-                self, w, h, bgra, box[0], box[1], max_zoom=MAX_ZOOM,
-                radius=radius, page=P.CARD)
+            want = (box[0], box[1], float(MAX_ZOOM))
+        # ⚠️ 成品图的 key 一定要**量化**（向下取整到 16px）。
+        #    不量化的话，信息卡高度随文件名/目录长短变几个像素 -> 画布高度变
+        #    几个像素 -> `want` 变几个像素 -> 上一次的成品图**整张作废**。
+        #    实测就是：12 张图在缓存里躺着 24 份，每次选一组都未命中、都要
+        #    后台重编码一遍。量化之后画布抖几个像素照样命中。
+        #    向下取整是为了让缓存里的图**不大于**格子（宁可小几个像素，
+        #    也绝不能溢出被裁）。
+        Q = 16
+        wq = max(Q, int(want[0]) // Q * Q)
+        hq = max(Q, int(want[1]) // Q * Q)
+        pkey = (path, w, h, wq, hq, crop)
+        img = self.big.photo(pkey)
+        if img is not None:
+            dw, dh = img.width(), img.height()
+        else:
+            # 没现成的图：**不要在主线程等**（编码 145ms + Tk 解码 38ms，
+            # 两格同时就是半秒，切一组就卡一下）。先顶一张占位上去，
+            # 编码交给后台线程，算完再换（见 `_fit_async`）。
+            self._fit_async(col, path, pkey, w, h, bgra,
+                            (wq, hq, want[2]), radius)
+            img, dw, dh = self._placeholder(col, path, want[0], want[1])
         if img is None:
             cv.create_text(cw // 2, ch // 2, text="这张图显示不了",
                            fill=P.WARN_D, font=self.f_small)
@@ -1655,12 +1801,19 @@ class App(tk.Tk):
     # ------------------------------------------------------------------
     # 结论 / 信息
     # ------------------------------------------------------------------
-    def _update_verdict(self, pair):
+    def _update_verdict(self, pair, fit=True):
+        """`fit=False` 表示「 caller 待会儿会统一 fit 一次」，别自己刷。
+
+        结论行并进信息卡之后这两者是同一张卡，各刷一次就是两遍
+        全局 `update_idletasks()`（19ms/次）—— 切一组白付 38ms。
+        """
         try:
             self._verdict_impl(pair)
         finally:
-            # 内容换过就得让卡片重新量一次高度，否则新文字被裁（见 Card.fit_to_content）
-            self.verdict_card.fit_to_content()
+            if fit:
+                # 内容换过就得让卡片重新量一次高度，否则新文字被裁
+                # （见 Card.fit_to_content / App._fit_card）
+                self._fit_card()
 
     def _verdict_impl(self, pair):
         a, b = self.path_a, self.path_b
@@ -1707,11 +1860,46 @@ class App(tk.Tk):
         self.verdict_tag.configure(text="强边 · 参与分组" if strong
                                    else "宽松边 · 仅疑似")
 
-    def _fill_info(self):
+    def _fit_card(self):
+        """量一次信息卡高度，并把它**只增不减地钉住**。
+
+        为什么必须钉住：信息卡高度取决于文件名/目录那一行的长短
+        （长一点就多折一行）。高度一变 -> 下面预览画布的高度跟着变
+        -> 解码尺寸变 -> 成品图缓存的 key 变 -> **整批作废**。
+        实测：卡片在 162 / 186 之间来回跳，画布 757 / 733 来回跳，
+        于是同一张图在缓存里躺着两份（720 和 736），每次选一组都未命中、
+        都要后台重编码一遍。钉住之后画布尺寸恒定，缓存才真的命中。
+        """
+        self.info_card.fit_to_content()
+        # ⚠️ 用**内容本身**的高度（req_height），不是 `cget("height")`：
+        #    后者已经跟 min_h 取过 max，在它上面加预留会逐次累加
+        #    —— 实测一路加到 306px，信息卡吃掉半个窗口。
+        h = self.info_card.req_height()
+        if DEBUG:
+            print("[卡片] req=%d min_h(旧)=%d -> 量到 %d；钉住前 %d"
+                  % (self.info_card.body.winfo_reqheight(),
+                     self.info_card.min_h, h, self._info_min_h),
+                  file=sys.stderr)
+        # ⚠️ 「清晰度（NIQE）」那半句是**后台**算的，算完才往信息行里拼
+        #    （"分辨率 … · 质量 高清 · 清晰度 NIQE 3.21（良好）"），拼完更长，
+        #    很容易多折一行 -> 卡片 162 长到 186 -> 下面预览画布 757 缩到 733
+        #    -> 解码尺寸变 -> 成品图缓存整批作废（实测每次选一组都要重编码一遍）。
+        #    所以只要**当前显示的图还有 NIQE 没算完**，就先多留一行，
+        #    让卡片从第一帧起就是最终高度，布局不再抖。
+        for _col, got in self._niqe_lbl.items():
+            if got and self.niqec.cached(got[0]) is None:
+                h += int(self.f_small.metrics("linespace"))
+                break
+        if h > self._info_min_h:
+            self._info_min_h = h
+        self.info_card.min_h = self._info_min_h
+
+    def _fill_info(self, fit=True):
         try:
             self._fill_info_impl()
         finally:
-            self.info_card.fit_to_content()
+            if fit:
+                self._fit_card()
 
     def _fill_info_impl(self):
         """两图信息**并排对照**，压成紧凑几行（把高度让给图片）。
@@ -1966,8 +2154,9 @@ class App(tk.Tk):
             # 并且顺带填好左下「与它相似」和右侧 —— 这里不用再补一遍。
             self._fill_all_list()
         self._sync_view_btns()
-        self._update_verdict(self.pair)
-        self._fill_info()
+        self._update_verdict(self.pair, fit=False)
+        self._fill_info(fit=False)
+        self._fit_card()
         self.render_all()
 
     # ------------------------------------------------------------------
