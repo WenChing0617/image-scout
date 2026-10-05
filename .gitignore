@@ -1,0 +1,19 @@
+# 构建产物与工具链
+.build-venv/
+build/
+dist/
+build.log
+build_tail.txt
+
+# 本机截图（验收用，不进仓库）
+screenshot.png
+shot-*.png
+app-icon-preview.png
+
+# Python
+__pycache__/
+*.pyc
+
+# 打包产物走 Release，不进 git
+ImageScout.exe
+ImageScout.spec
