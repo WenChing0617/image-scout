@@ -12,6 +12,8 @@ _probe_set/
 _probe_big.png
 perf_probe*.py
 _*.txt
+# 端到端探针（probe_e2e.py）的样本与解包产物
+_e2e/
 
 # 本机截图（验收用，不进仓库）
 screenshot.png

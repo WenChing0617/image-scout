@@ -504,7 +504,102 @@ def test_big_zoom():
     print("   精确帧欠采样 %s" % " ".join("%.2fx" % v for v in sharp))
     check(worst <= 1.15, "放大后是清楚的（最差 %.2fx 欠采样 <= 1.15）" % worst)
 
+    # ---- ⚠️⚠️⚠️ **直接读像素**查色块（v1.6 加，这是唯一能抓住
+    #      「放大全是马赛克」那条 bug 的断言）
+    #
+    # `undersample()` 是**间接**判据：它量的是「显示尺寸 vs 基准档」，
+    # 答的是「有没有取到够清晰的**档**」。而 v1.4/v1.5 那个 bug
+    # 发生在**取完档之后**的最后一步 —— `uikit.resample_img` 把
+    # 缩放比逼成 11/10 然后 `subsample(10)` + `zoom(11)`，
+    # **档位取得再对也没用**，像素在最后一步被丢了。
+    # 所以间接判据可以全绿而屏幕上全是色块（主人的原话「一点没好」）。
+    #
+    # 这里改成从画布上**真的把像素读回来**，量「最大同值游程」：
+    # 真放大时相邻像素都不同（游程 1），一旦有像素被复制就飙到
+    # zoom 倍数量级。实测（probe_e2e.py --broken 对照）：
+    #     旧算法（先丢后放）游程 32 / 38 / 34 / 32 px
+    #     新算法（GDI+ 插值）游程 2 / 3 px
+    # 差一个数量级，门槛取 6 两侧都安全。
+    def max_run():
+        """从画布图元那张图里读中间一行，算最长同值游程。"""
+        v = app._view.get(0)
+        if not v or not v.get("item") or not v.get("img"):
+            return None
+        img = v["img"]
+        w, h = img.width(), img.height()
+        if w < 16 or h < 16:
+            return None
+        # ⚠️ 读 **G 通道**：测试图的 R 通道是平滑渐变（只跟 x 有关），
+        #    读它量到的「不同取值数」恒定很低，会误判成糊（踩过）。
+        g = [img.get(x, h // 2)[1] for x in range(w)]
+        seg, longest = 1, 1
+        for i in range(1, len(g)):
+            if g[i] == g[i - 1]:
+                seg += 1
+                if seg > longest:
+                    longest = seg
+            else:
+                seg = 1
+        return float(longest)
+
+    runs = []
+    size_errs = []
+    for _ in range(6):
+        app._on_wheel(0, Ev(120))
+        app.update()
+        settle_render(app)
+        r = max_run()
+        if r is not None:
+            runs.append((app.zoom[0], r))
+        # ⚠️⚠️ **顺带量精确帧的图元有没有比应有尺寸小**（v1.6 露白根因）。
+        #    这一条比拖动那段更早暴露问题：探针量到过「精确帧也是错的」
+        #    （要 1818×880 给了 1248×833），而拖动测试要到放大档才量到。
+        #    口径：量 `want - img`（负值=露白量），画大是安全的。
+        # ⚠️ 用产品记的 `want`，别自己从 `base`/`disp` 反推（见拖动段注释）。
+        v = app._view.get(0, {})
+        img = v.get("img")
+        want = v.get("want")
+        if img is not None and want:
+            short = max(want[0] - img.width(), want[1] - img.height())
+            size_errs.append((app.zoom[0], short))
+            if short > 2:
+                print("      zoom %.2f **图元 %s 比应有 %s 少 %d px**"
+                      % (app.zoom[0], (img.width(), img.height()), want, short))
+    print("   逐档最大游程 %s"
+          % " ".join("%.2f@%.2fx" % (r, z) for z, r in runs))
+    print("   逐档图元富余 %s（<=0 表示画大了，安全）"
+          % " ".join("%+d@%.2fx" % (d, z) for z, d in size_errs))
+    check(bool(runs), "读到了画布像素（max_run 有返回）")
+    # ⚠️ 门槛 6 是 --broken 对照实测校准出来的，不是拍的。
+    # 6 档全都要过 —— 色块是主人真正报的 bug，任何一档有都不行。
+    check(max(r for _z, r in runs) <= 6.0,
+          "屏幕上没有马赛克方块（最大游程 %.0f px <= 6）"
+          % max(r for _z, r in runs))
+    # ⚠️ Tk 的 zoom/subsample 只接受整数倍，给不出精确尺寸（见拖动段注释）。
+    #    口径同上：不得比应有尺寸小。
+    check(bool(size_errs) and max(d for _z, d in size_errs) <= 2,
+          "逐档图元不小于应有尺寸（最小富余 %+d px >= -2）"
+          % (max((d for _z, d in size_errs), default=-1)))
+
     # 再滚一遍同样的位置：应该几乎不花钱
+    # ⚠️⚠️ **两处必须注意**（v1.6 踩到）：
+    # ① 必须先走两遍再量。这一段原来只量一遍，于是「第一次去某个新档」
+    #    和「重复去同一档」混在一起 —— 第一次必然要 GDI+ 插值 + 建图
+    #    （实测 76ms），第二次才是 3ms。混着量的最差值 106ms 报成
+    #    「重复位置很慢」，其实那 106ms 是**第一次**的代价。
+    #    探针实测：去 3.05 用 50ms（第一次）、再回到 3.05 只用 9ms。
+    # ② ⚠️⚠️ **前后都必须归位 zoom**。我第一版只加了预热循环、没归位，
+    #    于是这一段结束时 zoom 停在 6.00x（`ZOOM_MAX` 上限），
+    #    **后面所有段都从 6.00x 起步、再也滚不动** ——
+    #    「精确帧欠采样」量成 1.11/1.38/1.73/2.16x、
+    #    「逐档最大游程」6 档全是 6.00x，全是这一个污染造成的假红。
+    #    测试之间**共享 zoom 状态**，加一段测试就会改动后续测试的起点。
+    app.reset_zoom()
+    settle_render(app)
+    for d in (120, 120, -120, -120):
+        app._on_wheel(0, Ev(d))
+        app.update()
+        settle_render(app)
     again = []
     for d in (120, 120, -120, -120):
         t0 = time.perf_counter()
@@ -515,23 +610,53 @@ def test_big_zoom():
     print("   走过的位置再来一次 %.0f~%.0f ms" % (min(again), max(again)))
     check(max(again) < 40, "重复的位置几乎不花钱（最慢 %.0f ms < 40 ms）"
           % max(again))
+    app.reset_zoom()                    # ⚠️ 归位，别影响后面几段
+    settle_render(app)
 
     # ---- 滚轮**快速帧**的清晰度（这一条是被主人两次反馈逼出来的）----
     # 滚轮每一格走的都是快速档，主人看到的就是这些帧。上一版只测了
     # 「停手后的精确帧」，而精确帧本来就是同步解出来的、必然清晰 ——
     # 于是快速帧的 1.3~1.9 倍欠采样完全没被测到。
     # ⚠️ 判据同样是视口口径（见上面 `undersample()` 的注释）。
+    #
+    # ⚠️⚠️ **必须「立刻量」，不能先 `settle_render`**（v1.6 踩到）：
+    # `_on_wheel` 里排了一个 **170ms 防抖的精确帧**
+    #（`self._later("zoomhi%d", 170, ...)`）。`settle_render` 会一直等到
+    # 那一帧真的画完 —— 于是量到的**恰恰是精确帧**，永远是清晰的，
+    # 快速帧本身从来没被量到。我这里量到 1.38x 误判成「快速帧很糊」，
+    # 而单独跑一遍立刻量的探针，真实快速帧是 **0.88x**（清晰）。
+    #
+    # 正确做法：**只 `app.update()` 一次**（让这一格的快速帧贴上去），
+    # 立刻量，然后才 `settle_render` 等精确帧收尾。
     fast = []
     for _ in range(4):
-        app._on_wheel(0, Ev(-120))          # 先退回低倍
+        # ⚠️⚠️ **必须在 zoom > 1 的地方量，而且要确认量到了真值**。
+        # 我第一版写成「退一格再进一格」，可上面那段结束时 zoom 是 1.0
+        # （我新加的 `reset_zoom`），于是两步之后还是 1.0 ——
+        # 而 **zoom 1.0 不走分块路径**，`undersample()` 里
+        # `if not v or "base" not in v: return 0.0` 直接返回 0，
+        # 四次全量到 0.00x，**断言「全过」**。
+        # 这是我自己造的假绿：比假红更坏，它把「没测到」报成了「合格」。
+        # 现在先滚上去量，再退回来。
         app._on_wheel(0, Ev(120))
         app.update()
         settle_render(app)
-        fast.append(undersample())
+        app._on_wheel(0, Ev(-120))          # 先退回低倍
+        app._on_wheel(0, Ev(120))
+        app.update()
+        u = undersample()                   # ⚠️ 立刻量，别等精确帧
+        fast.append(u)
+        settle_render(app)                  # 收尾：等精确帧落地
+    # ⚠️ 每档都必须量到**真值**（>0），否则说明压根没走到分块渲染。
+    check(all(v > 0 for v in fast),
+          "快速帧每一档都量到了（不是全 0）%s"
+          % " ".join("%.2f" % v for v in fast))
     worst_fast = max(fast) if fast else 0.0
     print("   快速帧欠采样 %s" % " ".join("%.2fx" % v for v in fast))
     check(worst_fast <= 1.15,
           "滚轮过程中是清楚的（最差 %.2fx 欠采样 <= 1.15）" % worst_fast)
+    app.reset_zoom()                        # 归位，别影响后面几段
+    settle_render(app)
 
     # ---- 真实拖动：画面必须始终盖满画布 ----
     # ⚠️⚠️ 这条是被「拖动的时候图片直接空白了」逼出来的。
@@ -556,6 +681,8 @@ def test_big_zoom():
     # 在两个都有足够平移余量的 zoom 档上测（余量太小的档贴边，测的是
     # 「图的边界」而不是「缓冲够不够」，那是另一回事）
     pans = []
+    size_bad = 0            # 图元尺寸对不上的次数（拖动露白的根因）
+    worst_size_err = 0      # 尺寸误差的最大值（px）
     for nz in (3, 6):
         app.reset_zoom()
         app.update()
@@ -574,6 +701,30 @@ def test_big_zoom():
         if rng_x < 40 or rng_y < 40:
             continue                       # 平移余量太小，跳过
         app._pan_start(0, Ev(0))
+        # ⚠️⚠️ **判据口径：`>= want` 而不是 `== want`**（v1.6 踩了三轮）。
+        #
+        # `_render_tile` 的图元贴在 `ox + px0/sx`（显示坐标），要求它
+        # **盖住** `[px0/sx, px0/sx + want]` 这一段：
+        #   - 画**小于** `want` -> 右侧/下侧露白（v1.6 的 bug，54%）
+        #   - 画**等于** `want` -> 精确
+        #   - 画**大于** `want` -> 也安全：多出来的被画布裁掉。
+        #     `up = 1/sx < 1` 那一档（基准像素比需要的多）走的就是这条，
+        #     实测 zoom 1.95：want=1817×880 而画了 2206×1068（大 21%），
+        #     覆盖率 100% —— **画大是安全的，不是 bug**。
+        # 之前我按 `== want` 判，误报了这一档（389px 假警报）。
+        # ⚠️ 这个断言必须先自证不是读到了过期状态（下面的 [拖动前] 行），
+        #    否则它就只是个会误报的检查。
+        _v0 = app._view.get(0, {})
+        _im0 = _v0.get("img")
+        _w0 = _v0.get("want")
+        print("   [拖动前] zoom=%.2f img=%s want=%s disp=%s base=%s"
+              % (app.zoom[0],
+                 (_im0.width(), _im0.height()) if _im0 else None,
+                 _w0, _v0.get("disp"), _v0.get("base")))
+        if _im0 is not None and _w0:
+            if _im0.width() < _w0[0] - 2 or _im0.height() < _w0[1] - 2:
+                print("      ⚠️ 拖动前这一帧就比应有尺寸小（会露白）——"
+                      "下面量到的可能不是产品的锅")
         # ⚠️ `_pan_move` 里算的是 `pan = 拖动起点pan + (鼠标坐标 - 起点坐标)`，
         #    起点坐标是 `Ev(0)` 的 `x=10`，起点 pan 是 0。所以要让 pan 落在
         #    `[-rng, +rng]`，鼠标坐标得写 `10 + rng*t` ——
@@ -596,17 +747,37 @@ def test_big_zoom():
             #    不了，量到的「露白 40/40」全是假的（探针自己骗自己，踩过）。
             time.sleep(0.016)
             cov = cover()
+            # ⚠️⚠️ **顺带量「图元有没有比应有尺寸小」**（v1.6 拖动露白的根因）。
+            #    覆盖率是**后果**，尺寸是**原因** —— 差一个像素就已经在露白
+            #    边缘了，只是面积小到 `cover()` 还没察觉。分开量才能在
+            #    「刚坏」的时候就抓住，而不是等覆盖率掉到 54%。
+            #    量的是**负值**（`want - img`）：画大了安全（画布裁掉），
+            #    画小了才露白。口径见 `[拖动前]` 那段注释。
+            # ⚠️ 用产品记的 `want`，别自己从 `base`/`disp` 反推 ——
+            #    拖动时异步双三次帧回来会换基准档，反推的 `want` 与这一帧
+            #    无关（实测假报 389px，测试自己错了三轮）。
+            v = app._view.get(0, {})
+            img = v.get("img")
+            want = v.get("want")
+            if img is not None and want:
+                # >0 表示**小了那么多像素**（露白量）；<=0 表示够大，安全
+                short = max(want[0] - img.width(), want[1] - img.height())
+                if short > 2:
+                    size_bad += 1
+                    if size_bad <= 4:
+                        print("      step%d **图元 %s 比应有 %s 少 %d px**（会露白）"
+                              % (k + 1, (img.width(), img.height()), want, short))
+                worst_size_err = max(worst_size_err, short)
             if cov < 0.97:
-                v = app._view.get(0, {})
-                bb = app.cv_a.bbox(v["item"]) if v.get("item") else None
+                bb = app.cv_a.bbox(v.get("item")) if v.get("item") else None
                 print("      step%d pan=(%d,%d)覆盖 %.0f%% bbox=%s 基=%s 块=%s"
                       % (k + 1, app.pan[0][0], app.pan[0][1], cov * 100,
                          bb, v.get("base"), v.get("blk")))
             worst = min(worst, cov)
         app._pan_end()
         settle_render(app)
-        print("   zoom %.2f 可拖 ±%d,±%d 最差覆盖 %.0f%%"
-              % (app.zoom[0], rng_x, rng_y, worst * 100))
+        print("   zoom %.2f 可拖 ±%d,±%d 最差覆盖 %.0f%%  图元最小富余 %+d px"
+              % (app.zoom[0], rng_x, rng_y, worst * 100, worst_size_err))
         # ⚠️门槛是95% 而不是 100%：拖到**图的边缘**时块的边界就是图的边界，
         #    此时图本身不够高/宽来填满画布，留1~2% 边是正常的
         #    （实测最差 99%，`bbox` 高 837 而视口+缓冲是 953）。
@@ -614,6 +785,15 @@ def test_big_zoom():
         #    主人说的「图片直接空白了」。
         check(worst >= 0.95,
               "拖动时画面盖满画布（最差 %.0f%% >= 95%%）" % (worst * 100))
+        # ⚠️⚠️ **这条才是根因断言**。Tk 的 `zoom()`/`subsample()` 只接受
+        #    **整数倍**，`uikit.resample_img` 用有理数 p/q 逼近也给不出
+        #    精确尺寸 —— 实测要 1818×880 它给 1472/1248/1080，图元右侧
+        #    就缺 13~46%（覆盖率 87%/72%/54% 三值循环）。
+        #    口径：**图元不得比应有尺寸小**（画大安全，画小必露白）。
+        check(worst_size_err <= 2,
+              "图元不小于应有尺寸（最小富余 %+d px >= -2）" % worst_size_err)
+    check(size_bad == 0,
+          "全程没有一次图元小于应有尺寸（%d 次）" % size_bad)
     if pans:
         print("   拖动 %.1f ms/次（最大 %.1f ms）"
               % (sum(pans) / len(pans), max(pans)))

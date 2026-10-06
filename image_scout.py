@@ -1792,11 +1792,23 @@ class App(tk.Tk):
                                   self.rect_b, precise)
 
     # ---- 异步出图（把最贵的「编码」挪出主线程）----------------------
-    def _fit_async(self, col, path, key, w, h, bgra, want, radius):
+    def _fit_async(self, col, path, key, w, h, bgra, want, radius,
+                   need_gdip=None, interp=None):
         """后台把像素编码成给 Tk 的字节，回主线程再做 PhotoImage。
 
         主线程只留 `PhotoImage` + 贴图（实测 38 + 46ms），
         最贵的 145ms 编码和 88ms 解码都挪到后台 —— 这就是「切一组不再卡」。
+
+        ⚠️⚠️ `need_gdip` 给定时，**后台线程会先做 GDI+ 插值缩放**
+        （v1.6 新增）。这是「放大清晰」的关键，而它必须放后台：
+        主线程跑双三次要 25~30ms，加上编码和建图整帧 70~80ms ——
+        滚轮每一格都等这一帧，实测放大最慢从 86ms（v1.5）涨到 105ms。
+        GDI+ 是纯像素计算、不碰 Tk，放后台安全。
+
+        ⚠️ `interp` 选插值模式。**占位/拖动帧用 `IM_BILINEAR`**：
+        实测 1818×880 双三次 28.6ms、双线性 6.2ms（尺寸都严格精确，
+        见 probe_placeholder.py），而占位图只顶几十毫秒，双线性绰绰有余。
+        `None` = 双三次（精确帧默认）。
         """
         if self._fit_pend.get(col) == key:
             return                                   # 同一帧已经在算了
@@ -1809,7 +1821,20 @@ class App(tk.Tk):
 
         def work():
             try:
-                ppm, ww, hh = uikit.fit_ppm(w, h, bgra, radius, P.CARD)
+                ww, hh, px = w, h, bgra
+                if need_gdip:
+                    if interp is None:
+                        r = winimg._gdip_scale_argb(ww, hh, px,
+                                                    int(need_gdip[0]),
+                                                    int(need_gdip[1]))
+                    else:
+                        r = winimg._gdip_scale_argb2(ww, hh, px,
+                                                     int(need_gdip[0]),
+                                                     int(need_gdip[1]),
+                                                     interp)
+                    if r:
+                        ww, hh, px = r
+                ppm, _pw, _ph = uikit.fit_ppm(ww, hh, px, radius, P.CARD)
             except Exception:
                 ppm = None
             # ⚠️ 编码完的字节可能不小（25MB），只在主线程短暂持有
@@ -1838,12 +1863,20 @@ class App(tk.Tk):
             return
         try:
             img = tk.PhotoImage(data=ppm, master=self)
-            # ⚠️ 分块渲染 **必须** 走 resample_img：它要的是「这块该多大就多大」，
-            #    而 fit_img 是「装进格子为止」，会一路缩过头（920 -> 683）。
             if isinstance(key, tuple) and key and key[0] == "tile":
-                img = uikit.resample_img(img, want[0], want[1], want[2])
-                if img is None:
-                    return
+                # ⚠️⚠️ **分块渲染的像素在后台已经缩到目标尺寸了，这里
+                #    **绝不能**再 resample**。
+                #    - `want=None`：缩放已由后台的 GDI+ 完成（放大帧）
+                #    - `want=(tw,th,64)`：缩放该由这里用 `resample_img` 做
+                #      （缩小帧 —— 点抽样足够，见 uikit 里那段注释）
+                #
+                #    一旦在这里再 resample 一次，就等于把 Tk 的 `zoom()`
+                #    （最近邻）请回来 —— 主人在 v1.4/v1.5 看到的 20×20
+                #    色块就是这么来的（见 probe_resample.py 的对照实验）。
+                if want is not None:
+                    img = uikit.resample_img(img, want[0], want[1], want[2])
+                    if img is None:
+                        return
             else:
                 img, _dw, _dh = uikit.fit_img(img, want[0], want[1], want[2])
         except Exception:
@@ -1852,7 +1885,27 @@ class App(tk.Tk):
         self.render_all(precise=True, only=col)
 
     def _placeholder(self, col, path, cw, ch):
-        """高清图还没就绪时的占位：先用别的档位/缩略图顶上，别让格子空着。"""
+        """高清图还没就绪时的占位：先用别的档位/缩略图顶上，别让格子空着。
+
+        ⚠️⚠️ **尺寸可以不准**（v1.6 起 `_render_tile` 不再走它）。
+        分块渲染曾经靠它占位，而它给不出精确尺寸，直接造成了拖动露白：
+        实测要 1818×880 它给 1472/1248/1080（`resample_img` 只能整数倍），
+        图元右侧就缺 13~46%（见 probe_pan.py）。所以那块改成**同步**
+        GDI+ 双线性，压根不占位了 —— 6.2ms 换尺寸精确，很划算。
+
+        剩下的调用方是**非分块路径**（`zoom <= 1`，整张图缩进格子），
+        那里尺寸差一点点只是居中偏移几像素，不影响「盖不满画布」。
+
+        ⚠️ 这里用 `resample_img` 走 Tk 的 `zoom()`（最近邻），放大时会有块 ——
+        但 `resample_img` 已经**不再搭配 `subsample`**，所以看到的是
+        「放大的真实像素」而不是「丢过信息的色块」：形状轮廓对得上，
+        只是一眼能看出是放大的。精确帧到达后立刻被替换。
+
+        ⚠️⚠️ **但仍要限制 `max_zoom`**：占位图是给「图正在后台编码」那几百
+        毫秒用的，`zoom(20)` 一张 1500×1000 的缓存图要 80ms ——
+        比它要顶的那段时间还长。实测 profile 里这一格占 35ms，
+        一半是 `zoom`、一半是被后台线程抢 GIL。
+        """
         src = None
         for k in self.big._p:
             if k[0] == path:
@@ -1933,29 +1986,23 @@ class App(tk.Tk):
     # 每往外留这么多（占可视区比例）的缓冲，拖动时就不必立刻重画。
     # ⚠️ 0.30 时块面积是**视口的 3.4 倍**（(1+2×0.30)²，再乘上「视口比
     #    显示图小」的那部分），zoom 2.44 那档实测 367 万像素、编码 152ms ——
-    #    清晰度够了但卡。0.15 约 1.7 倍，编码砍到四成。滑出缓冲也只是
-    #    80ms 节流后补一帧，松手还会补一张精确帧。
-    # ⚠️ 0.30 时块面积是**视口的 3.4 倍**（(1+2×0.30)²，再乘上「视口比
-    #    显示图小」的那部分），zoom 2.44 那档实测 367 万像素、编码 152ms ——
-    #    清晰度够了但卡。
+    #    清晰度够了但卡。0.15 约 1.7 倍，编码砍到四成。
     # 实测（真实照片，3000×2000 拖动 40 步，零露白的前提下）：
     #    0.15 → 最慢 121ms    0.10 → 100ms    0.08 → 91ms
     # 取 0.10：每边留 150px 缓冲，快速甩鼠标也不露；0.08 只留 121px，
     # 省下的 9ms 不值得赌一次露白。块面积约视口的 1.44 倍。
-    TILE_PAD = 0.10    # 块比这个还大就丢后台做，主线程先顶占位。
-    # ⚠️ 原来定在 50 万（那时块是从**粗档**裁的，尺寸估不准）。现在基准档
-    #    跟显示尺寸对齐之后，块的大小只跟**视口**有关：实测 70~150 万像素
-    #    的块，同步编码只要 8.7~18.5ms，整帧 28~35ms。反而是这个阈值太紧，
-    #    让滚动时常常走异步、屏幕上顶的是占位图 —— 那比糊更难看。
-    # 提到 160 万之后，滚轮中间那几档（块 240~276 万像素）又落回异步 ——
-    # 实测整帧 114~119ms，其中 `fit_ppm` 34ms 全在**后台线程**（主线程只花
-    # `crop 14 + resample 9`）；但那 20ms 里屏幕上顶的是一张**糊的占位图**，
-    # 而滚轮每 100ms 就换一档，占位图永远等不到替换它的那一帧就被顶掉 ——
-    # 主人看到的就是**全程马赛克**（滚轮快速帧实测欠采样 1.29~1.65 倍）。
-    # 提到 300 万：滚轮和拖动一律同步画完。实测（噪声图，最坏情况）同步
-    # 一帧 60~80ms、异步只要 20ms —— 慢 3 倍换全程清晰，这笔账划算，
-    # 主人明确说了「放大还有马赛克」不能忍。松手后的精确帧不受影响。
-    TILE_SYNC_PX = 3000000
+    TILE_PAD = 0.10    # 每边留这么多缓冲，滑出去才补新块。
+    #
+    # ⚠️⚠️ **v1.6 曾有两个「块多大 / 放大多大」的阈值，现在都没了**
+    #（`TILE_SYNC_PX = 2000000` 和 `TILE_GDIP_MIN = 1.16`）。
+    # 它们是在**占位图给不出精确尺寸**的前提下靠阈值绕开销的：
+    #   - `TILE_SYNC_PX`：块太大就丢后台，主线程先顶占位。
+    #   - `TILE_GDIP_MIN`：up ≤ 1.16 就按块原尺寸显示。
+    # 而占位图走的是 Tk 的整数倍缩放，**给不出精确尺寸** —— 实测要
+    # 1818×880 给了 1472×982，覆盖率掉到 54%（probe_pan.py）。
+    # 阈值绕不过「尺寸必须精确」这条硬约束，只能整个换掉：
+    # 现在是 **`up > 1` 一律同步 GDI+ 双线性**（6.2ms，尺寸精确），
+    # 精确帧再异步补一张双三次。没有占位图，也就没有尺寸问题。
 
     # 拖动补块的最小间隔（秒）。
     # ⚠️ 原来硬编码 0.08s，**这是拖动露白的主因之一**：80ms 内快速拖动能挪
@@ -2077,31 +2124,143 @@ class App(tk.Tk):
         py1 = min(bh, max(py0 + 8, int(math.ceil(vy1 * sy))))
         blkW, blkH = px1 - px0, py1 - py0
 
-        _tw, _th, cbgra = thumbs.crop_bgra(bw, bh, bbgra, px0, py0, blkW, blkH)
         twant = max(16, int(round(blkW / sx)))
         thwant = max(16, int(round(blkH / sy)))
 
         # key 里带上 zoom / 视口位置 / 基准尺寸，任一变化就换一块新的
         pkey = ("tile", path, bw, bh, int(zoom * 1000), px0, py0, blkW, blkH,
                 twant, thwant)
+
+        # ⚠️⚠️⚠️ **必须先查缓存，再插值/编码**（v1.6 修马赛克时踩的性能坑）。
+        #
+        # 我第一版把 GDI+ 插值和 PPM 编码放在了查缓存**之前**，于是拖动 /
+        # 滚轮回到走过的位置时，缓存明明命中了，却还是把「裁块 + 双三次
+        # + 编码」整套重做一遍才丢弃 —— 实测「走过的位置再来一次」要
+        # **103ms**（v1.5 是 3ms），放大最慢从 86ms 涨到 197ms。
+        #
+        # 顺序很重要：**key 只依赖 blkW/blkH/twant/zoom/视口位置**，
+        # 全都在上面算好了，所以查缓存根本不需要先插值。
         img = self.big.photo(pkey)
         if img is not None:
             dw, dh = img.width(), img.height()
-        elif blkW * blkH <= self.TILE_SYNC_PX:
-            # 块不大 —— 直接算出来，省得先占位再替换（那样会闪一下）
+            cv.delete("all")
+            item = cv.create_image(ox + int(round(px0 / sx)),
+                                   oy + int(round(py0 / sy)),
+                                   anchor="nw", image=img)
+            self._keep.append(img)
+            self._view[col] = {"cv": cv, "item": item, "ox": ox, "oy": oy,
+                               "px": self.pan[col][0], "py": self.pan[col][1],
+                               "disp": (disp_w, disp_h), "base": (bw, bh),
+                               "blk": (blkW, blkH),
+                               # 同上：这一帧应有的图元尺寸（给 test_ui 当判据）
+                               "want": (twant, thwant),
+                               "img": img}
+            self._render_caption(cap, path, disp_w)
+            return True
+
+        # ⚠️ `crop_bgra` 放在查缓存**之后**：它要把 (blkW×blkH×4) 字节从
+        #    基准档里拷出来一份，块越大越贵。缓存命中时完全不需要它
+        #    （旧代码在查缓存之前就裁了，每次回拖都白裁一遍）。
+        _tw, _th, cbgra = thumbs.crop_bgra(bw, bh, bbgra, px0, py0,
+                                           blkW, blkH)
+
+        # ⚠️⚠️⚠️ **放大时在像素层做插值，绝不能交给 Tk**（v1.6 的核心修复）。
+        #
+        # 主人在 v1.4 / v1.5 看到的 20×20 色块，根因就在这一步：
+        # `uikit.resample_img` 把缩放比逼成有理数 p/q，放大 1.1 倍会
+        # 精确命中 **11/10**，于是走 `subsample(10)` → `zoom(11)` ——
+        # `subsample` 是**点抽样**（真丢像素），横向只剩 1/11 的信息。
+        # 实测 1000px 的 1px 细条纹走这条路**振幅从 255 塌到 0**，
+        # 整张图变成一块纯色（见 probe_resample.py 的对照实验）。
+        #
+        # Tk 只有 `zoom()`（最近邻）和 `subsample()`（点抽样），
+        # **两个都不是插值** —— 只有 GDI+ 的 `HighQualityBicubic` 是。
+        # 实测 20 倍放大下游程仍是 1px（probe_interp.py）。
+        # 系统看图器放大清晰就是这个原因。
+        #
+        # ⚠️⚠️ **而 GDI+ 还有第二个、更要命的优势：输出尺寸任意精确。**
+        #
+        # Tk 的两个操作**只接受整数倍**，`resample_img` 用有理数 p/q
+        # 逼近也给不出精确尺寸 —— 要 1818 宽它给 1472/1248/1080。
+        # 而 `_render_tile` 把图元贴在 `ox + px0/sx`（显示坐标），
+        # **画出来的图元必须严格等于 `(twant, thwant)`**，差一像素就露白。
+        # 这就是拖动露白的根因（详见下面 `up` 那段）。
+        #
+        # 什么时候会真的放大？基准档**被原图封顶**的时候：
+        # `_level()` 里 `lv = min(lv, native)`，所以放大到超过原生
+        # 分辨率后基准档就是原图，块只有 1324×641 却要显示成 1818×880
+        # （实测 up = 1.373）。这几档插值是刚需。
+        # ⚠️⚠️⚠️ **判据是「1:1 会不会盖不满」，方向千万别搞反**
+        #（v1.6 拖动露白的根因，踩了两轮才想明白）。
+        #
+        # 图元贴在 `ox + px0/sx`（显示坐标），而**画出来的图元必须严格
+        # 等于 `(twant, thwant)`** —— 差一个像素就是右侧/下侧露白。
+        # 而 `twant = blkW / sx`，所以：
+        #   - `up = 1/sx < 1` → 基准像素**比需要的多**，按块原尺寸画
+        #     **盖过**需求 → 安全，一个像素都不用插值（大多数档位）。
+        #     实测 zoom 1.95 落在这一档（up=0.914），所以它一直 100% 通过。
+        #   - `up = 1/sx > 1` → 基准像素**不够**（基准被原图封顶，
+        #     `_level` 里 `lv = min(lv, native)`），按原尺寸画**盖不满**。
+        #     实测 zoom 3.81 是 up=1.373：块 1324×641，画出来也是
+        #     1324×641，而视口+缓冲要 1818×880 —— **右侧少 27%**，
+        #     实测覆盖率按 87%/72%/54% 三值循环（1472/1248/1080 ÷ 1818，
+        #     那三个数是 `resample_img` 用整数倍凑出来的）。
+        #
+        # ⚠️ 之前这里是 `up > 1.16` 才插值、否则按 1:1 —— **方向错了**：
+        #    1 < up ≤ 1.16 那一段正好是「差一点就盖不满」，全露白。
+        #    Tk 给不出精确尺寸，所以 `up > 1` **必须**用 GDI+。
+        up = max(twant / float(max(1, blkW)), thwant / float(max(1, blkH)))
+
+        if up <= 1.0:
+            # 基准有富余：按块原尺寸贴，一个像素都不插值。
+            # 画出来比理想值大（up<1），画布自然裁掉，看不出差别。
             ppm, _pw, _ph = uikit.fit_ppm(blkW, blkH, cbgra, 0)
             if ppm is None:
                 return False
             img = tk.PhotoImage(data=ppm, master=self)
-            # ⚠️ 这里必须是 `resample_img`，**不能**用 `fit_img`：
-            #    后者会一路缩到「装得下为止」，把 920 宽的块缩成 683。
-            img = uikit.resample_img(img, twant, thwant, 64.0)
             self.big.put_photo(pkey, img)
-            dw, dh = img.width(), img.height()
+            dw, dh = blkW, blkH
         else:
-            self._fit_async(col, path, pkey, blkW, blkH, cbgra,
-                            (twant, thwant, 64.0), 0)
-            img, dw, dh = self._placeholder(col, path, twant, thwant)
+            # ⚠️⚠️ **基准不够，必须插值**，而且**必须同步做**。
+            #
+            # 曾经想「先顶占位、插值丢后台」，但占位图**同样得是精确
+            # 尺寸**（否则照样露白），而要精确尺寸就得插值 —— 后台
+            # 一点都省不下来，反而多一次「占位 → 精确」的替换闪烁。
+            # 实测那一帧 44~55ms，其中占位 0~3.6ms、后台 6.2ms(GDI+)
+            # + 20ms(编码) 全是**白花**的：`_fit_ready` 回来时 pan
+            # 早就变了，结果直接被丢掉（`_fit_pend_state` 那道门）。
+            #
+            # 双线性 6.2ms 就够（probe_placeholder.py 实测 1818×880：
+            # 双三次 28.6ms、双线性 6.2ms，两者尺寸都严格精确）。
+            # 拖动要的是「跟手 + 不露白」，不是极致锐度 ——
+            # 真正的双三次在下面异步补，几十毫秒后换上。
+            r = winimg._gdip_scale_argb2(blkW, blkH, cbgra, twant, thwant,
+                                         winimg.IM_BILINEAR)
+            if r is None:
+                # GDI+ 不可用（理论上不会，winimg 全靠它解码）：
+                # 退回按块原尺寸，至少不空画布。
+                ppm, _pw, _ph = uikit.fit_ppm(blkW, blkH, cbgra, 0)
+                if ppm is None:
+                    return False
+                img = tk.PhotoImage(data=ppm, master=self)
+                dw, dh = blkW, blkH
+            else:
+                sw, sh, sbgra = r
+                ppm, _pw, _ph = uikit.fit_ppm(sw, sh, sbgra, 0)
+                if ppm is None:
+                    return False
+                img = tk.PhotoImage(data=ppm, master=self)
+                dw, dh = sw, sh
+            self.big.put_photo(pkey, img)
+            # ⚠️ **精确帧再异步补一张双三次**。它写进同一个 `pkey`，
+            #    回来时 `_fit_ready` 走缓存命中那格直接换上 ——
+            #    这就是「拖动/滚动时双线性够用，停手后变双三次」。
+            # ⚠️ `want=None`：像素已在后台缩到目标尺寸，
+            #    `_fit_ready` 里绝不能再 resample（见那里那段注释）。
+            if precise >= 1:
+                self._fit_async(col, path, pkey, blkW, blkH, cbgra,
+                                None, 0, need_gdip=(twant, thwant),
+                                interp=winimg.IM_BICUBIC)
         if img is None:
             return False
 
@@ -2120,6 +2279,14 @@ class App(tk.Tk):
                            # 「放大后有没有马赛克」就是看这两个：
                            # 显示宽 / 块宽 > 1.5 就是欠采样（肉眼可见的糊）。
                            "base": (bw, bh), "blk": (blkW, blkH),
+                           # ⚠️⚠️ **这一帧的图元「应该」是多大**（v1.6）。
+                           #    图元贴在 `ox + px0/sx`（显示坐标），所以它必须
+                           #    严格等于 `(twant, thwant)`，差一像素就露白。
+                           #    记下来给 test_ui 当判据 —— 别让测试去用
+                           #    `base`/`disp` 反推：拖动时异步双三次帧回来会
+                           #    换基准档（`base` 变大），反推的 `want` 就对不上了
+                           #    （实测假报 389px 误差，测试自己错了三轮）。
+                           "want": (twant, thwant),
                            "img": img}
         self._render_caption(cap, path, disp_w)
         if DEBUG:

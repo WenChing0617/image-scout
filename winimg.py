@@ -291,6 +291,13 @@ _LOCK_READ = 1
 _INTERP_HQ_BICUBIC = 7          # InterpolationModeHighQualityBicubic
 _OFFSET_HQ = 2                  # PixelOffsetModeHighQuality
 
+# ⚠️ 公开别名：调用方（`image_scout._placeholder`、探针）不该去记
+#    GDI+ 的数字常量。「尺寸精确 + 质量够用」的组合就是最近邻。
+IM_BICUBIC = _INTERP_HQ_BICUBIC
+IM_BILINEAR = 5                 # InterpolationModeBilinear
+IM_BILINEARHQ = 6               # InterpolationModeHighQualityBilinear
+IM_NEAREST = 2                  # InterpolationModeNearestNeighbor
+
 gdiplus.GdiplusStartup.argtypes = [POINTER(ctypes.c_size_t),
                                    POINTER(_GdipStartupInput), c_void_p]
 gdiplus.GdiplusStartup.restype = c_int
@@ -370,8 +377,15 @@ def _gdip_pixels(bmp):
         gdiplus.GdipBitmapUnlockBits(bmp, byref(d))
 
 
-def _gdip_scale(bmp, out_w, out_h):
-    """用 GDI+ 自己缩（HighQualityBicubic）—— 比在 Python 里遍历像素快几个数量级。"""
+def _gdip_scale(bmp, out_w, out_h, interp=_INTERP_HQ_BICUBIC,
+                offset=_OFFSET_HQ):
+    """用 GDI+ 自己缩（默认 HighQualityBicubic）—— 比在 Python 里遍历像素快几个数量级。
+
+    ⚠️ `interp` / `offset` 是给「占位图」这类**只要尺寸对、不追求质量**
+    的场景降本用的：双三次 1818×880 要 25~30ms，最近邻只要几毫秒
+    （实测见 probe_placeholder.py）。**精确帧永远用默认的双三次** ——
+    那是「放大不马赛克」的保证，占位图只顶几十毫秒。
+    """
     dst = c_void_p()
     if gdiplus.GdipCreateBitmapFromScan0(out_w, out_h, 0, _PIXFMT_32BPP_ARGB,
                                          None, byref(dst)):
@@ -381,14 +395,83 @@ def _gdip_scale(bmp, out_w, out_h):
         gdiplus.GdipDisposeImage(dst)
         return None
     try:
-        gdiplus.GdipSetInterpolationMode(g, _INTERP_HQ_BICUBIC)
-        gdiplus.GdipSetPixelOffsetMode(g, _OFFSET_HQ)
+        gdiplus.GdipSetInterpolationMode(g, interp)
+        gdiplus.GdipSetPixelOffsetMode(g, offset)
         if gdiplus.GdipDrawImageRectI(g, bmp, 0, 0, out_w, out_h):
             return None
         return _gdip_pixels(dst)
     finally:
         gdiplus.GdipDeleteGraphics(g)
         gdiplus.GdipDisposeImage(dst)
+
+
+def _gdip_argb_to_bitmap(w, h, bgra):
+    """BGRA 内存块 -> GpBitmap。
+
+    ⚠️ 走 `GdipCreateBitmapFromScan0` 再**逐行拷进它自己的缓冲区**，
+    不能把 Python 的 bytes 直接交给它：它的 Scan0 得是 GDI+ 认的布局，
+    而且 stride 可能带对齐 padding（不是 w*4）。
+    """
+    if not _ensure_gdiplus():
+        return None
+    bmp = c_void_p()
+    if gdiplus.GdipCreateBitmapFromScan0(w, h, 0, _PIXFMT_32BPP_ARGB,
+                                         None, byref(bmp)):
+        return None
+    d = _GdipBitmapData()
+    rect = (c_int * 4)(0, 0, w, h)
+    if gdiplus.GdipBitmapLockBits(bmp, byref(rect), _LOCK_READ,
+                                  _PIXFMT_32BPP_ARGB, byref(d)):
+        gdiplus.GdipDisposeImage(bmp)
+        return None
+    try:
+        row = w * 4
+        if d.Stride == row:
+            ctypes.memmove(d.Scan0, bgra, row * h)
+        else:
+            for y in range(h):
+                ctypes.memmove(d.Scan0 + y * d.Stride, bgra + y * row, row)
+    finally:
+        gdiplus.GdipBitmapUnlockBits(bmp, byref(d))
+    return bmp
+
+
+def _gdip_scale_argb(w, h, bgra, out_w, out_h):
+    """一块 BGRA -> GDI+ 高质量双三次缩放 -> (out_w, out_h, BGRA)。
+
+    ⚠️ 这是「放大不马赛克」的关键。Tk 的 `PhotoImage` 只有两种缩放：
+    `subsample()`（**点抽样**，直接丢弃像素）和 `zoom()`（**最近邻**，
+    复制像素）。**两个叠起来就是纯马赛克** —— 先丢 90% 的像素再放大
+    11 倍，横向只剩 1/11 的信息（见 `probe_resample.py` 的实测）。
+
+    GDI+ 的 `HighQualityBicubic` 是真插值：它在目标像素之间算加权平均，
+    放大任意倍数都不会出色块。系统看图器放大清晰就是这个原因。
+    """
+    bmp = _gdip_argb_to_bitmap(w, h, bgra)
+    if bmp is None:
+        return None
+    try:
+        return _gdip_scale(bmp, out_w, out_h, interp, offset)
+    finally:
+        gdiplus.GdipDisposeImage(bmp)
+
+
+def _gdip_scale_argb2(w, h, bgra, out_w, out_h, interp=_INTERP_HQ_BICUBIC,
+                      offset=_OFFSET_HQ):
+    """`_gdip_scale_argb` 的可指定插值模式版本。
+
+    ⚠️ **输出尺寸严格等于 `(out_w, out_h)`** —— 这是它相对 Tk 的
+    `zoom`/`subsample` 的决定性优势：那两个只能整数倍，给不出精确尺寸
+    （实测把 1818 宽逼近成 1472/1248/1080，拖动时图元右侧就缺 13~46%，
+    见 probe_pan.py）。**尺寸精确是拖动不露白的前提**，质量可以商量。
+    """
+    bmp = _gdip_argb_to_bitmap(w, h, bgra)
+    if bmp is None:
+        return None
+    try:
+        return _gdip_scale(bmp, out_w, out_h, interp, offset)
+    finally:
+        gdiplus.GdipDisposeImage(bmp)
 
 
 def load_pixels_exact(path: str, max_side: int | None = None):
