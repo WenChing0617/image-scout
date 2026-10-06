@@ -422,19 +422,28 @@ class BigCache:
             k = next(iter(self._p))
             self._p_bytes -= self._psize(self._p.pop(k))
 
-    def _level(self, near: int) -> int:
-        """把「要多大」量化到 256 一档 —— 同一档能被不同 zoom 共用。"""
-        near = max(64, int(near))
-        return min(self.BASE_MAX,
-                   int(math.ceil(near / float(self.BASE_STEP))
-                       * self.BASE_STEP))
+    def _level(self, near: int, native: int = 0) -> int:
+        """把「要多大」量化到 256 一档 —— 同一档能被不同 zoom 共用。
 
-    def peek_base(self, path: str, near: int = 0):
+        ⚠️ `native` 是原图长边，**必须封顶**：原图 3000×2000 的照片，
+        要 4096 那一档的话解码器会拿 SCALEUP 硬放大到 4096×2731 ——
+        像素数凭空多 37%，什么新信息都没有，白花 83ms + 43MB 内存。
+        最高只需要原图那么大。
+        """
+        near = max(64, int(near))
+        lv = min(self.BASE_MAX,
+                 int(math.ceil(near / float(self.BASE_STEP))
+                     * self.BASE_STEP))
+        if native > 0:
+            lv = min(lv, int(native))
+        return max(64, lv)
+
+    def peek_base(self, path: str, near: int = 0, native: int = 0):
         """已有档里**最小的、够用的**那一档（**绝不解码**）。
 
         放wheel 的快速档要用它 —— 那时候绝不能触发解码，否则就是卡顿本身。
         """
-        lv = self._level(near)
+        lv = self._level(near, native)
         d = self._b.get(path)
         if not d:
             return None
@@ -448,7 +457,7 @@ class BigCache:
         d[best] = d.pop(best)                    # 挪到末尾，算 LRU
         return got[0], got[1], got[2]
 
-    def peek_best(self, path: str, near: int):
+    def peek_best(self, path: str, near: int, native: int = 0):
         """已有档里**不超过要用的、最清晰的**那一档（**绝不解码**）。
 
         ⚠️ 为什么不能退回 `peek_any`（最粗的那一档）：精确帧是要给用户看清楚
@@ -456,7 +465,7 @@ class BigCache:
         刚才异步算好的那一块全白算，主线程还得再算一遍（实测 28.7ms 就是
         这么来的）。拿最接近的清晰档，key 对得上，缓存直接命中。
         """
-        lv = self._level(near)
+        lv = self._level(near, native)
         d = self._b.get(path)
         if not d:
             return None
@@ -467,7 +476,7 @@ class BigCache:
         got = d.pop(best) if best is not None else None
         if got is None:
             # 手上的档都比要用的大：那就取最小的够用档（多出来的清晰度白给）
-            return self.peek_base(path, near)
+            return self.peek_base(path, near, native)
         d[best] = got                             # 挪到末尾，算 LRU
         return got[0], got[1], got[2]
 
@@ -486,7 +495,7 @@ class BigCache:
         d[lv] = d.pop(lv)
         return got[0], got[1], got[2]
 
-    def base(self, path: str, near: int = 0):
+    def base(self, path: str, near: int = 0, native: int = 0):
         """取一级基准像素（按 256 分档，多家共用）。
 
         ⚠️ 为什么必须分档：固定用 2048 那一档时，**块的大小跟 zoom 成反比**
@@ -494,7 +503,7 @@ class BigCache:
         比放大还贵。分档之后「视口该多大就取哪一档」，块始终 ≈ 视口大小，
         成本跟 zoom 基本无关。
         """
-        lv = self._level(near or self.BASE_MAX)
+        lv = self._level(near or self.BASE_MAX, native)
         d = self._b.setdefault(path, {})
         got = d.get(lv)
         if got is not None:
@@ -1640,7 +1649,10 @@ class App(tk.Tk):
         self._prewarm_yield()         # 正在缩放：预热别来抢 GIL
         # 先用缓存里已有的图立刻响应（绝不同步重解大图 —— 那是「缩放好卡」
         # 的根源），再防抖 170ms 按新 zoom 精确重解一帧。连滚 N 格只解一次。
-        self.render_all(precise=False, only=col)
+        # ⚠️ 系数 0.75 不是 0.5：粗档是 2 倍欠采样，主人反馈「放大还有马赛克」。
+        #    0.75 欠采样 1.33 倍（看不出糊），而正在看的那两张在预热里已经
+        #    备满了档，这里几乎都是缓存命中，代价一样是几毫秒。
+        self.render_all(precise=0.75, only=col)
         self._later("zoomhi%d" % col, 170,
                     lambda c=col: self.render_all(precise=True, only=c))
         self._toast("%s缩放 %.0f%%（滚轮调整，按住可拖动）"
@@ -1687,7 +1699,10 @@ class App(tk.Tk):
         now = time.time()
         if now - self._drag_last >= 0.08 and self._tile_needs_more(col, cv, px, py):
             self._drag_last = now
-            self.render_all(precise=False, only=col)
+            # ⚠️ 用 **0.75 中间档**，别用 `precise=False`：粗档只有一半分辨率，
+            #    拖动全程都是 2~6 倍欠采样 —— 主人反馈「推拽还有马赛克」就是
+            #    这里。0.75 欠采样 1.33 倍（看不出糊），块像素只有精确档的 56%。
+            self.render_all(precise=0.75, only=col)
 
     def _tile_needs_more(self, col, cv, px, py):
         """平移之后，渲染好的那块还能不能盖住整个画布？（不够就 Fasching 要重取）"""
@@ -1892,14 +1907,29 @@ class App(tk.Tk):
     # ---- 分块渲染（缩放不卡的关键）--------------------------------
     # Zoom 之后只把**屏幕上真正看得见的那块**交给 Tk。
     # 每往外留这么多（占可视区比例）的缓冲，拖动时就不必立刻重画。
-    TILE_PAD = 0.30
+    # ⚠️ 0.30 时块面积是**视口的 3.4 倍**（(1+2×0.30)²，再乘上「视口比
+    #    显示图小」的那部分），zoom 2.44 那档实测 367 万像素、编码 152ms ——
+    #    清晰度够了但卡。0.15 约 1.7 倍，编码砍到四成。滑出缓冲也只是
+    #    80ms 节流后补一帧，松手还会补一张精确帧。
+    TILE_PAD = 0.15
     # 块比这个还大就丢后台做，主线程先顶占位。
-    # ⚠️ 实测过：调到 1.2M 反而更慢（块比估算的大，同步做要 40~80ms/档）。
-    #    定在 500k：超过就后台编码 + 便宜的占位顶上，主线程只要 10~30ms。
-    TILE_SYNC_PX = 500000
+    # ⚠️ 原来定在 50 万（那时块是从**粗档**裁的，尺寸估不准）。现在基准档
+    #    跟显示尺寸对齐之后，块的大小只跟**视口**有关：实测 70~150 万像素
+    #    的块，同步编码只要 8.7~18.5ms，整帧 28~35ms。反而是这个阈值太紧，
+    #    让滚动时常常走异步、屏幕上顶的是占位图 —— 那比糊更难看。
+    #    提到 160 万：常见的块都能同步画完，不闪。
+    TILE_SYNC_PX = 1600000
 
     def _render_tile(self, col, cv, cap, path, box, zoom, precise=True):
         """zoom>1：只渲染视口那一块。
+
+        ⚠️ `precise` 不是布尔，是**清晰度系数**（0.5 ~ 1.0）：
+          - `False`（0）→ 滚轮快速帧，滚得动优先，画糊一点无妨（170ms 内被替换）
+          - `0.75`      → 拖动补块，要看得清（主人反馈「推拽还有马赛克」）
+          - `True`（1） → 精确帧，缩停之后补清晰的那一张
+        取中间档是有依据的：**有缓存时精确帧比粗档还便宜**（实测 3ms vs 23ms，
+        因为粗档的 key 跟精确档不同，等于多算一张）；欠采样 1.33 倍已经
+        看不出糊，而块像素只有精确档的 56%，拖动才跟得上。
 
         ⚠️ 老做法是「按 zoom 向系统重新解码一整张更大的图」（实测
         4000×3000 的照片 zoom=4 要 **229ms**：解码 75 + 编码 83 + Tk 38），
@@ -1926,32 +1956,45 @@ class App(tk.Tk):
         oy = (ch - disp_h) // 2 + self.pan[col][1]
 
         # 想要的对图的分辨率 —— 决定用哪一级基准来出这块。
-        # ⚠️ 快速档**故意用一半分辨率**：成本跟「块有多少像素」成正比，
-        #    长边 640 和 1280 之间是 **4 倍**的差别。先用粗的顶上（几毫秒），
-        #    170ms 去抖之后再用匹配的那一级补精确帧。
+        # ⚠️ 按**显示图**长边算（再被 `native` 封顶），不是按视口。视口只有
+        #    1515 宽，但放大到 5.96 倍时显示图有 6437 宽 —— 这时候只有把
+        #    基准档顶到原图（3000）才够清晰，用视口口径会只取 1536 那档、
+        #    欠采样 4.19 倍，糊得没法看。实测：视口口径快（19~52ms）但糊，
+        #    显示图口径清晰（1.1x，物理极限 2.15x）且同样 24~52ms。
+        # ⚠️ `native` 是原图长边：档位**封顶在原图**，别让解码器拿 SCALEUP
+        #    硬放大出比原图还大的像素（3000 的图解出 4096 级 = 凭空多 37%
+        #    像素、83ms、43MB 内存，一点新信息都没有）。
         need_side = max(disp_w, disp_h)
-        if precise:
-            # ⚠️ 精确帧也**不许在主线程解码**：zoom 3.81 那一档要 4096 级的基准
-            #    （12.6M 像素），实测主线程要等 400ms —— 正是「滚到某一档突然卡住」。
-            #    先看有没有现成的；没有就叫后台去解，拿粗的先顶着，解好再换。
-            got = self.big.peek_base(path, need_side)
+        native = max(wh)
+        # 精确帧要**真的解出够清晰的那一档**：主人反馈「放大还有马赛克，
+        # 不如上一个版本」—— 根因就是这一档缺了却只拿 1536 顶着，
+        # 拿 904 宽的块去填 2425 宽的显示区，2.7 倍欠采样。
+        # 实测解一档 49~95ms，而后台补档要等 3 秒才轮得到 ——
+        # 「等三秒才清楚」在体感上就等于「一直马赛克」。所以这里同步解。
+        # ⚠️ 判据必须是 `>= 1` 不是 `if precise`：拖动补块传的是 0.75，
+        #    `if 0.75` 为真 → 拖动/滚轮会全走精确档，块大 2 倍、慢一倍
+        #    （实测 109ms），这正是「清晰了但又卡回去」的原因。
+        if precise >= 1:
+            got = self.big.peek_base(path, need_side, native)
             if got is None:
-                # 缺正好那一档：先拿**最清晰的、不超过要用的**那一档顶着
-                # （绝不能退回最粗档 —— 那会让块的尺寸变、缓存全作废），
-                # 真正那一档交给后台，解好后自动换成清楚的。
+                got = self.big.base(path, need_side, native)
+            if got is None:
+                # 真解不出来（超大图 / 内存不够）：退回手上有的一档
                 self._base_prep(col, path, need_side)
-                got = (self.big.peek_best(path, need_side)
+                got = (self.big.peek_best(path, need_side, native)
                        or self.big.peek_any(path))
         else:
-            # ⚠️ 快速档**绝不解码**，而且要**故意用粗档**：块有多少像素就花多少
-            #    钱。拿「最小的够用档」会得到 1536，块一下变成 157 万像素，
-            #    只能走异步 —— 那是「滚一格卡一下」的根源。这里取**不超过
-            #    一半的那个最清晰档**，块立刻小一个量级。
-            got = self.big.peek_best(path, max(256, need_side // 2))
+            # ⚠️ 快速档**绝不解码**，但也别一味用粗档：粗档是 2~3 倍欠采样，
+            #    主人反馈「放大还有马赛克」大半来自这里。这里按 `precise`
+            #    系数（滚轮 0.5 / 拖动 0.75）要分辨率，**手上有多清晰就用
+            #    多清晰** —— 正在看的那两张在预热里已经备满了档，通常直接
+            #    命中，就是 1:1 清晰、几毫秒画完。够不着的才退粗档。
+            want = int(need_side * (precise or 0.5))
+            got = self.big.peek_best(path, max(256, want), native)
             if got is None:
                 got = self.big.peek_any(path)      # 手上有哪一档就用哪一档
             if got is None:
-                got = self.big.base(path, need_side)   # 真没有：这一回躲不掉
+                return False                        # 手上空的：交给精确帧
         if not got:
             return False
         bw, bh, bbgra = got
@@ -2008,7 +2051,11 @@ class App(tk.Tk):
                                anchor="nw", image=img)
         self._view[col] = {"cv": cv, "item": item, "ox": ox, "oy": oy,
                            "px": self.pan[col][0], "py": self.pan[col][1],
-                           "disp": (disp_w, disp_h)}
+                           "disp": (disp_w, disp_h),
+                           # 记下这一帧是用**哪一级基准**画的，以及块多大 ——
+                           # 「放大后有没有马赛克」就是看这两个：
+                           # 显示宽 / 块宽 > 1.5 就是欠采样（肉眼可见的糊）。
+                           "base": (bw, bh), "blk": (blkW, blkH)}
         self._render_caption(cap, path, disp_w)
         if DEBUG:
             print("[分块] 侧%d %s zoom %.2f 显示 %dx%d 取块 %dx%d -> 画 %dx%d"
@@ -2028,6 +2075,12 @@ class App(tk.Tk):
     # 的那几张上，剩下的备好适应窗口那张成品图就够了（那是「打开卡一下」的
     # 大头）。排前面的正是当前这两张 + 当前组的图。
     PREWARM_BASE_MAX = 16
+    # ⚠️ **正在看的那两张**额外把中间几档也备满，别的图只备 768/1536/原图。
+    # 理由：清晰和流畅在这里是同一件事 —— 缺档就得在主线程同步解，实测
+    # 2304 档 95ms、2816 档 70ms（主推会「滚到某一档突然卡住」）；备好了
+    # 滚轮快速档就能直接命中，1:1 清晰、几毫秒就画完。空闲时解不心疼。
+    PREWARM_FULL_N = 2
+    PREWARM_FULL_LV = (1024, 2048, 2560)   # 中间档，配合原图档盖住 768~3000
 
     def _prewarm_start(self):
         """扫描完 / 布局稳定后，后台把各组要用的图准备好。
@@ -2081,7 +2134,8 @@ class App(tk.Tk):
         每个环节都没超过 3ms，整帧却被拖到 97ms，全花在等 GIL 上。
         所以这里只登记，防抖 300ms（连滚 N 格只解最后一次要的那一档）。
         """
-        lv = self.big._level(need)
+        wh = META.of(path)["wh"]
+        lv = self.big._level(need, max(wh) if wh else 0)
         key = (path, lv)
         if key in self._base_prep_done or key in getattr(self, "_base_busy", ()):
             return
@@ -2104,7 +2158,8 @@ class App(tk.Tk):
 
         def work():
             try:
-                ok = self.big.base(path, need) is not None
+                wh = META.of(path)["wh"]
+                ok = self.big.base(path, need, max(wh) if wh else 0) is not None
             except Exception:
                 ok = False
             self._ui(self._base_prepped, key, col, ok)
@@ -2143,6 +2198,10 @@ class App(tk.Tk):
         n = getattr(self, "_prewarm_n", 0)
         self._prewarm_n = n + 1
         want_base = n < self.PREWARM_BASE_MAX
+        # 正在看的那两张多备中间档（见 PREWARM_FULL_N）
+        full = n < self.PREWARM_FULL_N
+        if full:
+            lvs = sorted(set(lvs) | set(self.PREWARM_FULL_LV))
 
         def work():
             out = []
@@ -2161,8 +2220,11 @@ class App(tk.Tk):
                     wh = META.of(path)["wh"]
                     top = max(wh) if wh else max(box)
                     for lv in lvs:
-                        if lv <= top:
-                            self.big.base(path, lv)
+                        if lv < top:
+                            self.big.base(path, lv, top)
+                    # ⚠️ 预热时顺手把**原图那一档**也备上：放大到 2 倍以上时
+                    #    需要的正是它，不备的话第一帧要同步解 49~95ms。
+                    self.big.base(path, top, top)
             except Exception:
                 import traceback
                 traceback.print_exc()
@@ -2234,7 +2296,7 @@ class App(tk.Tk):
                 return
         if crop:
             got = self.big.get(path, self._crop_decode_size(path, desc, rect, box))
-        elif precise:
+        elif precise >= 1:
             got = self._decode(path, box[0], box[1], zoom)
         else:
             # 快速档：**只用缓存里已有的**，绝不同步重解。
@@ -2259,7 +2321,7 @@ class App(tk.Tk):
         #    把已经解码好的像素变成 Tk 图要 ~180ms（编码 145 + Tk 解码 38），
         #    比解码本身还贵。命中就直接贴图，切回同一组/滚回同一档不再重付这笔钱。
         if zoom > 1.001 and not crop:
-            if precise:
+            if precise >= 1:
                 # 放大：解码时已经按 zoom 要过更大的图，这里 1:1 贴上去，
                 # 超出的部分由画布自然裁掉，正好可以拖着看局部。
                 want = (w, h, 1e9)

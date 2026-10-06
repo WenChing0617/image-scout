@@ -455,6 +455,40 @@ def test_big_zoom():
     check(max(up) < 80, "大图放大不卡（最慢 %.0f ms < 80 ms）" % max(up))
     check(max(down) < 80, "大图缩小不卡（最慢 %.0f ms < 80 ms）" % max(down))
 
+    # ---- 清晰度：这一条是被用户反馈逼出来的（2026-10-06「放大还有马赛克」）
+    # 判据是**视口口径**的欠采样倍数：屏幕上真正看得见的那一块，
+    # 是用多少个源像素撑起来的。>1.4 就是肉眼可见的糊。
+    # ⚠️ 别拿 `disp_w / blk_w` 算 —— 块含一圈缓冲、显示图比视口大，
+    #    那个比值天然偏大，会把清晰的帧也判成糊（踩过）。
+    def undersample():
+        v = app._view.get(0)
+        if not v or "base" not in v:
+            return 0.0
+        cw, ch = app.cv_a.winfo_width(), app.cv_a.winfo_height()
+        dw, dh = v["disp"]
+        bw, bh = v["base"]
+        sx, sy = bw / float(dw), bh / float(dh)
+        ox, oy = v["ox"], v["oy"]
+        vx = min(dw, max(0, cw - ox)) - max(0, -ox)
+        vy = min(dh, max(0, ch - oy)) - max(0, -oy)
+        if vx <= 0 or vy <= 0:
+            return 0.0
+        return max(cw / float(vx * sx), ch / float(vy * sy))
+
+    sharp = []
+    for _ in range(4):
+        app._on_wheel(0, Ev(120))
+        app.update()
+        settle_render(app)
+        app.render_all(precise=True, only=0)      # 停手后的精确帧
+        app.update()
+        sharp.append(undersample())
+    # 原图 3000 宽放到 5 倍以上必然超过原生分辨率（放大镜的物理极限），
+    # 所以只要求前 4 档（zoom 1.25~2.44）真的 1:1。
+    worst = max(sharp[:3]) if sharp else 0.0
+    print("   精确帧欠采样 %s" % " ".join("%.2fx" % v for v in sharp))
+    check(worst <= 1.15, "放大后是清楚的（最差 %.2fx 欠采样 <= 1.15）" % worst)
+
     # 再滚一遍同样的位置：应该几乎不花钱
     again = []
     for d in (120, 120, -120, -120):
