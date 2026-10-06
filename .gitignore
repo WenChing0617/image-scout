@@ -1,9 +1,17 @@
 # 构建产物与工具链
 .build-venv/
 build/
+build*/
 dist/
+dist*/
 build.log
 build_tail.txt
+
+# 性能探针的临时产物
+_probe_set/
+_probe_big.png
+perf_probe*.py
+_*.txt
 
 # 本机截图（验收用，不进仓库）
 screenshot.png
@@ -16,4 +24,6 @@ __pycache__/
 
 # 打包产物走 Release，不进 git
 ImageScout.exe
+# PyInstaller 自动生成的 .spec（名字跟模块名一致，小写）
+image_scout.spec
 ImageScout.spec
