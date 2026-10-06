@@ -392,12 +392,18 @@ class BigCache:
     #    改成按**字节预算**淘汰：填满预算为止，热的那几张才真的留得住。
     BYTE_BUDGET = 192 * 1024 * 1024      # 原始像素
     PHOTO_BUDGET = 256 * 1024 * 1024     # 成品 Tk 图（Tk 那边大约也是 4 字节/px）
+    # 基准像素（给缩放取块用）：分 256 一档，多家共用。
+    BASE_MAX = 4096
+    BASE_STEP = 256
+    BASE_BUDGET = 320 * 1024 * 1024
 
     def __init__(self, limit: int = 5):
         self._c = {}
         self._p = {}
+        self._b = {}                      # 基准像素：path -> (w, h, bgra, max_side)
         self._c_bytes = 0
         self._p_bytes = 0
+        self._b_bytes = 0
 
     @staticmethod
     def _psize(img):
@@ -415,6 +421,112 @@ class BigCache:
         while self._p_bytes > self.PHOTO_BUDGET and len(self._p) > 1:
             k = next(iter(self._p))
             self._p_bytes -= self._psize(self._p.pop(k))
+
+    def _level(self, near: int) -> int:
+        """把「要多大」量化到 256 一档 —— 同一档能被不同 zoom 共用。"""
+        near = max(64, int(near))
+        return min(self.BASE_MAX,
+                   int(math.ceil(near / float(self.BASE_STEP))
+                       * self.BASE_STEP))
+
+    def peek_base(self, path: str, near: int = 0):
+        """已有档里**最小的、够用的**那一档（**绝不解码**）。
+
+        放wheel 的快速档要用它 —— 那时候绝不能触发解码，否则就是卡顿本身。
+        """
+        lv = self._level(near)
+        d = self._b.get(path)
+        if not d:
+            return None
+        best = None
+        for k in d:
+            if k >= lv and (best is None or k < best):
+                best = k
+        if best is None:
+            return None
+        got = d[best]
+        d[best] = d.pop(best)                    # 挪到末尾，算 LRU
+        return got[0], got[1], got[2]
+
+    def peek_best(self, path: str, near: int):
+        """已有档里**不超过要用的、最清晰的**那一档（**绝不解码**）。
+
+        ⚠️ 为什么不能退回 `peek_any`（最粗的那一档）：精确帧是要给用户看清楚
+        的，退回最粗档之后**块的尺寸就变了**，成品图的 key 跟着变 —— 于是
+        刚才异步算好的那一块全白算，主线程还得再算一遍（实测 28.7ms 就是
+        这么来的）。拿最接近的清晰档，key 对得上，缓存直接命中。
+        """
+        lv = self._level(near)
+        d = self._b.get(path)
+        if not d:
+            return None
+        best = None
+        for k in d:
+            if k <= lv and (best is None or k > best):
+                best = k
+        got = d.pop(best) if best is not None else None
+        if got is None:
+            # 手上的档都比要用的大：那就取最小的够用档（多出来的清晰度白给）
+            return self.peek_base(path, near)
+        d[best] = got                             # 挪到末尾，算 LRU
+        return got[0], got[1], got[2]
+
+    def peek_any(self, path: str):
+        """手上**任意**一档（优先最小的），**绝不解码**。
+
+        给滚轮的快速档兜底：合适那一档还没准备好时，宁可先拿粗的顶上
+        （会糊一点，但几毫秒就画好了），也绝不能在主线程上解码 ——
+        那一解就是 100~300ms，正好是主人说的「卡一下」。
+        """
+        d = self._b.get(path)
+        if not d:
+            return None
+        lv = min(d)
+        got = d[lv]
+        d[lv] = d.pop(lv)
+        return got[0], got[1], got[2]
+
+    def base(self, path: str, near: int = 0):
+        """取一级基准像素（按 256 分档，多家共用）。
+
+        ⚠️ 为什么必须分档：固定用 2048 那一档时，**块的大小跟 zoom 成反比**
+        ——zoom 小的时候块接近整张基准（3.1M 像素），实测缩小时要 200~342ms，
+        比放大还贵。分档之后「视口该多大就取哪一档」，块始终 ≈ 视口大小，
+        成本跟 zoom 基本无关。
+        """
+        lv = self._level(near or self.BASE_MAX)
+        d = self._b.setdefault(path, {})
+        got = d.get(lv)
+        if got is not None:
+            d[lv] = d.pop(lv)
+            return got[0], got[1], got[2]
+        r = winimg.load_pixels(path, lv,
+                               winimg.SIIGBF_RESIZETOFIT | winimg.SIIGBF_SCALEUP,
+                               raw=True)
+        if not r:
+            return None
+        d[lv] = (r[0], r[1], r[2])
+        self._b_bytes += len(r[2])
+        self._evict_b()
+        return r
+
+    def _evict_b(self):
+        while self._b_bytes > self.BASE_BUDGET:
+            oldest = None
+            for p, d in self._b.items():
+                if oldest is None:
+                    oldest = p
+                if len(d) > 1 or len(self._b) > 1:
+                    break
+            d = self._b.get(oldest)
+            if not d:
+                break
+            k = next(iter(d))
+            if len(d) == 1 and len(self._b) == 1:
+                break                            # 只剩最后一张，别把自己删空
+            self._b_bytes -= len(d.pop(k)[2])
+            if not d:
+                self._b.pop(oldest, None)
 
     def get(self, path: str, need: int, force: bool = False):
         need = max(64, int(need))
@@ -469,6 +581,10 @@ class BigCache:
         got = self._c.pop(path, None)
         if got is not None:
             self._c_bytes -= len(got[3])
+        gotb = self._b.pop(path, None)
+        if gotb is not None:
+            for _lv, v in gotb.items():
+                self._b_bytes -= len(v[2])
         for k in [k for k in self._p if k[0] == path]:
             self._p_bytes -= self._psize(self._p.pop(k))
 
@@ -537,11 +653,19 @@ class App(tk.Tk):
         self.zoom = [1.0, 1.0]
         self.pan = [[0, 0], [0, 0]]
         self._drag = None
+        self._drag_last = 0.0     # 拖动时「上一次重取一块」的时刻（节流用）
+        self._prewarm_q = []
+        self._prewarm_busy = False
+        self._prewarm_pause = 0.0
+        self._base_busy = set()       # 正在后台解码的 (路径, 档位)
+        self._base_prep_done = set()  # 解过（成功/失败都记，免得反复重试）
+        self._base_want = {}          # 想要但还没动手的 (路径, 档位) -> 参数
         self._q = queue.Queue()
         self._later_ids = {}
         self._keep = []           # 主预览图的引用
-        self._view = {}           # 侧 -> (画布, 图元, 显示宽, 显示高, 画布宽, 画布高)
+        self._view = {}           # 侧 -> {画布, 图元, 出图时的位置/平移量, 显示尺寸}
         self._fit_pend = {}       # 侧 -> 正在后台编码的那一帧（防重算 / 防张冠李戴）
+        self._fit_pend_state = {}  # 侧 -> 发起时的(zoom, 平移)，回来时比对用
         self._info_min_h = 0      # 信息卡被「只增不减」钉住的高度（见 _fit_card）
 
         self.preset_key = scan.DEFAULT_PRESET
@@ -788,7 +912,8 @@ class App(tk.Tk):
         cap.name_lbl, cap.dim_lbl, cap.hint_lbl = name, dim, hint
 
         cv.bind("<Configure>", lambda e, k=col: self._later("resize%d" % k,
-                                                           130, self.render_all))
+                                                           130,
+                                                           self._on_canvas_resize))
         # 双击 = 用系统看图器打开（原来那两个「打开 A/B」按钮删掉了）
         cv.bind("<Double-Button-1>", lambda e, k=col: self._open_side(k))
         cv.bind("<MouseWheel>", lambda e, k=col: self._on_wheel(k, e))
@@ -890,12 +1015,21 @@ class App(tk.Tk):
         self._group_mem = 0
         self.cur_member = None
         self.path_a = self.path_b = None
+        self._drag = None
+        self._drag_last = 0.0
+        self._prewarm_q = []
+        self._prewarm_busy = False
+        self._base_busy = set()
+        self._base_prep_done = set()
+        self._base_want = {}
+        self._prewarm_pause = 0.0
         self.pair = None
         self.zoom = [1.0, 1.0]        # 每侧一份（和 __init__ 里一致）
         self.pan = [[0, 0], [0, 0]]
         self.thumb = ThumbCache(self)
         self.big = BigCache()
         self._fit_pend = {}           # 侧 -> 正在后台算的那一帧（防重算/防张冠李戴）
+        self._fit_pend_state = {}
         self._niqe_lbl = {}           # 信息卡里「清晰度」那一段的引用
         self.glist.set_items([])
         self.mlist.set_items([])
@@ -1067,6 +1201,9 @@ class App(tk.Tk):
             self._fill_all_list()
         else:
             self._fill_group_list()
+        # 主人：「每组第一次打开会卡顿一下」—— 扫完就趁空闲把各组要用的图
+        # 在后台准备好，点开哪一组都是现成的。
+        self._prewarm_start()
 
     def _make_view_groups(self):
         """真组 + 「疑似对」伪组拼成一个列表。
@@ -1453,6 +1590,10 @@ class App(tk.Tk):
         self._fill_info(fit=False)
         self._fit_card()
         self.render_all()
+        # 主人：「每组第一次打开会卡顿一下」—— 刚显示出来的这两张要**排到预热
+        # 队列最前面**去备基准档，别排在那几十张后面慢慢等（防抖 250ms，
+        # 连着点组只会重排一次队列，不会每点一次就解一遍）。
+        self._later("prewarm", 250, self._prewarm_start)
 
     def _apply_grid(self):
         if self.mode == "pair":
@@ -1463,6 +1604,16 @@ class App(tk.Tk):
             self.cell_a.grid_configure(column=0, columnspan=2)
 
     # ---- 缩放 / 平移 ---------------------------------------------------
+    def _on_canvas_resize(self):
+        """画布尺寸变了：重画，并且**按新尺寸重做一次预热**。
+
+        ⚠️ 预热是按「当时的画布尺寸」准备成品图的，尺寸一变 key 就全对不上，
+        白准备一轮（实测：刚扫完时画布 748×849、信息卡定型后是 748×733，
+        于是回到 100% 那一档时又得现场解码 + 编码，130ms）。
+        """
+        self.render_all()
+        self._later("prewarm", 400, self._prewarm_start)
+
     def _on_wheel(self, col, ev):
         """滚轮只缩放**鼠标底下那一侧**。
 
@@ -1486,6 +1637,7 @@ class App(tk.Tk):
             return
         self.zoom[col] = z
         self.pan[col] = [0, 0]        # 只清这一侧的平移
+        self._prewarm_yield()         # 正在缩放：预热别来抢 GIL
         # 先用缓存里已有的图立刻响应（绝不同步重解大图 —— 那是「缩放好卡」
         # 的根源），再防抖 170ms 按新 zoom 精确重解一帧。连滚 N 格只解一次。
         self.render_all(precise=False, only=col)
@@ -1513,8 +1665,11 @@ class App(tk.Tk):
     def _pan_move(self, col, ev):
         """拖动平移。
 
-        ⚠️ 这里**只挪画布上的图元**，绝不能重新渲染 —— 重渲染会把整张图
-        重新编码成 PNG 再交给 Tk，鼠标一动就卡成幻灯片。
+        ⚠️ 这里**只挪画布上的图元**，绝不重新出图 —— 一移动就重画会卡成幻灯片。
+
+        ⚠️ 但分块渲染之后画布上只有「视口 + 一圈缓冲」，拖到缓冲外面就会露出
+        空白。所以超过缓冲就**节流**（80ms 一次）重取一块新的；松手时再补一张
+        精确的（`_pan_end`）。平时在缓冲内移动仍然是纯挪图元，零成本。
         """
         d = self._drag
         if not d or d[0] != col or self.zoom[col] <= 1.001:
@@ -1522,14 +1677,44 @@ class App(tk.Tk):
         info = self._view.get(col)
         if not info:
             return
-        cv, item, dw, dh, cw, ch = info
         px = d[3] + (ev.x - d[1])
         py = d[4] + (ev.y - d[2])
+        cv = info["cv"]
+        cv.coords(info["item"], info["ox"] + (px - info["px"]),
+                  info["oy"] + (py - info["py"]))
         self.pan[col][0], self.pan[col][1] = px, py
-        cv.coords(item, (cw - dw) // 2 + px, (ch - dh) // 2 + py)
+        # 离上一次出图超过 80ms 才允许再出一帧
+        now = time.time()
+        if now - self._drag_last >= 0.08 and self._tile_needs_more(col, cv, px, py):
+            self._drag_last = now
+            self.render_all(precise=False, only=col)
+
+    def _tile_needs_more(self, col, cv, px, py):
+        """平移之后，渲染好的那块还能不能盖住整个画布？（不够就 Fasching 要重取）"""
+        info = self._view.get(col)
+        if not info:
+            return False
+        cw = max(1, cv.winfo_width())
+        ch = max(1, cv.winfo_height())
+        dw, dh = info["disp"]
+        ox = (cw - dw) // 2 + px
+        oy = (ch - dh) // 2 + py
+        bb = cv.bbox(info["item"])
+        if not bb:
+            return True
+        # 左边/上边露白、右边/下边露白，都算不够
+        return (bb[0] > -1 and ox < -1) or (bb[1] > -1 and oy < -1) \
+            or (bb[2] < cw + 1 and ox + dw > cw + 1) \
+            or (bb[3] < ch + 1 and oy + dh > ch + 1)
 
     def _pan_end(self):
         self._drag = None
+        # 松手后按最终位置补一帧精确的（顺便触发后台基准升级）
+        for col in (0, 1):
+            if self.zoom[col] > 1.001 and self._view.get(col):
+                self._later("panend%d" % col, 90,
+                            lambda c=col: self.render_all(precise=True,
+                                                          only=c))
 
     def _open_side(self, col):
         p = self.path_a if col == 0 else self.path_b
@@ -1577,6 +1762,11 @@ class App(tk.Tk):
         if self._fit_pend.get(col) == key:
             return                                   # 同一帧已经在算了
         self._fit_pend[col] = key
+        # 记下**发起时的视图状态**：编码要一百多毫秒，等它回来时用户可能已经
+        # 又滚了几格。那时这块已经用不上了，别再拿它触发一次同步重画
+        # （实测那一画就是 28.7ms，正好卡在滚轮上）。
+        self._fit_pend_state[col] = (round(self.zoom[col], 4),
+                                     tuple(self.pan[col]))
 
         def work():
             try:
@@ -1598,11 +1788,25 @@ class App(tk.Tk):
         cur = self.path_a if col == 0 else self.path_b
         if mine:
             self._fit_pend.pop(col, None)
+            self._fit_pend_state.pop(col, None)
         if not mine or ppm is None or cur != path:
             return                       # 过期结果，丢掉（用户已经点走/换了档）
+        # 编码要一百多毫秒，回来时视图可能已经不是发起时那样了。这时候再同步
+        # 重画一次就是白花钱 —— 直接丢掉，等去抖后的精确帧自己来画。
+        st = self._fit_pend_state.get(col)
+        now = (round(self.zoom[col], 4), tuple(self.pan[col]))
+        if st is not None and st != now:
+            return
         try:
             img = tk.PhotoImage(data=ppm, master=self)
-            img, _dw, _dh = uikit.fit_img(img, want[0], want[1], want[2])
+            # ⚠️ 分块渲染 **必须** 走 resample_img：它要的是「这块该多大就多大」，
+            #    而 fit_img 是「装进格子为止」，会一路缩过头（920 -> 683）。
+            if isinstance(key, tuple) and key and key[0] == "tile":
+                img = uikit.resample_img(img, want[0], want[1], want[2])
+                if img is None:
+                    return
+            else:
+                img, _dw, _dh = uikit.fit_img(img, want[0], want[1], want[2])
         except Exception:
             return
         self.big.put_photo(key, img)
@@ -1623,7 +1827,13 @@ class App(tk.Tk):
                 src = None
         if src is None:
             return None, 0, 0
-        return uikit.fit_img(src, cw, ch, MAX_ZOOM if MAX_ZOOM > 8 else 8.0)
+        # ⚠️ 占位图也要用 resample_img：`fit_img` 遇到 s>1 会直接
+        #    `zoom(2)` 把**整张**缓存图放大（1500×1000 的图约 80ms），
+        #    而这里只是顶一下，画质无所谓、越快越好。
+        out = uikit.resample_img(src, cw, ch,
+                                 MAX_ZOOM if MAX_ZOOM > 8 else 8.0)
+        return (out, out.width(), out.height()) if out is not None \
+            else (None, 0, 0)
 
     def _rect_px(self, desc, w, h, rect):
         """工作网格坐标 -> 像素坐标。网格与图同长宽比，按比例放大即可。"""
@@ -1679,6 +1889,315 @@ class App(tk.Tk):
             got = self.big.get(path, need, force=True)
         return got
 
+    # ---- 分块渲染（缩放不卡的关键）--------------------------------
+    # Zoom 之后只把**屏幕上真正看得见的那块**交给 Tk。
+    # 每往外留这么多（占可视区比例）的缓冲，拖动时就不必立刻重画。
+    TILE_PAD = 0.30
+    # 块比这个还大就丢后台做，主线程先顶占位。
+    # ⚠️ 实测过：调到 1.2M 反而更慢（块比估算的大，同步做要 40~80ms/档）。
+    #    定在 500k：超过就后台编码 + 便宜的占位顶上，主线程只要 10~30ms。
+    TILE_SYNC_PX = 500000
+
+    def _render_tile(self, col, cv, cap, path, box, zoom, precise=True):
+        """zoom>1：只渲染视口那一块。
+
+        ⚠️ 老做法是「按 zoom 向系统重新解码一整张更大的图」（实测
+        4000×3000 的照片 zoom=4 要 **229ms**：解码 75 + 编码 83 + Tk 38），
+        越放大越贵 —— 主人第三次反馈「还是缩放卡顿」的根因就在这里。
+
+        系统自带的照片查看器为什么顺？因为它**只解码一次**，之后缩放是
+        显示层的事。这里照抄这个思路：`BigCache.base()` 解码一次留着，
+        每帧只从它身上裁一块 + 编码。实测同一张图：
+            zoom 2 -> 26ms   4 -> 7ms   6 -> 4ms
+        而且**越放大越便宜**（要画的块越小）。
+
+        返回 True 表示已经画好，调用方不要再走老路径。
+        """
+        wh = META.of(path)["wh"]
+        if not wh or wh[0] <= 0 or wh[1] <= 0:
+            return False
+        cw = max(1, cv.winfo_width())
+        ch = max(1, cv.winfo_height())
+
+        fit = min(box[0] / float(wh[0]), box[1] / float(wh[1]))
+        disp_w = max(1, int(round(wh[0] * fit * zoom)))
+        disp_h = max(1, int(round(wh[1] * fit * zoom)))
+        ox = (cw - disp_w) // 2 + self.pan[col][0]
+        oy = (ch - disp_h) // 2 + self.pan[col][1]
+
+        # 想要的对图的分辨率 —— 决定用哪一级基准来出这块。
+        # ⚠️ 快速档**故意用一半分辨率**：成本跟「块有多少像素」成正比，
+        #    长边 640 和 1280 之间是 **4 倍**的差别。先用粗的顶上（几毫秒），
+        #    170ms 去抖之后再用匹配的那一级补精确帧。
+        need_side = max(disp_w, disp_h)
+        if precise:
+            # ⚠️ 精确帧也**不许在主线程解码**：zoom 3.81 那一档要 4096 级的基准
+            #    （12.6M 像素），实测主线程要等 400ms —— 正是「滚到某一档突然卡住」。
+            #    先看有没有现成的；没有就叫后台去解，拿粗的先顶着，解好再换。
+            got = self.big.peek_base(path, need_side)
+            if got is None:
+                # 缺正好那一档：先拿**最清晰的、不超过要用的**那一档顶着
+                # （绝不能退回最粗档 —— 那会让块的尺寸变、缓存全作废），
+                # 真正那一档交给后台，解好后自动换成清楚的。
+                self._base_prep(col, path, need_side)
+                got = (self.big.peek_best(path, need_side)
+                       or self.big.peek_any(path))
+        else:
+            # ⚠️ 快速档**绝不解码**，而且要**故意用粗档**：块有多少像素就花多少
+            #    钱。拿「最小的够用档」会得到 1536，块一下变成 157 万像素，
+            #    只能走异步 —— 那是「滚一格卡一下」的根源。这里取**不超过
+            #    一半的那个最清晰档**，块立刻小一个量级。
+            got = self.big.peek_best(path, max(256, need_side // 2))
+            if got is None:
+                got = self.big.peek_any(path)      # 手上有哪一档就用哪一档
+            if got is None:
+                got = self.big.base(path, need_side)   # 真没有：这一回躲不掉
+        if not got:
+            return False
+        bw, bh, bbgra = got
+
+        # 视口 ∪ 缓冲 -> 「显示图」坐标系里的矩形
+        padx = int(min(disp_w, cw) * self.TILE_PAD)
+        pady = int(min(disp_h, ch) * self.TILE_PAD)
+        vx0 = max(0, min(disp_w - 1, -ox - padx))
+        vy0 = max(0, min(disp_h - 1, -oy - pady))
+        vx1 = max(vx0 + 8, min(disp_w, cw - ox + padx))
+        vy1 = max(vy0 + 8, min(disp_h, ch - oy + pady))
+
+        # 映射到基准像素
+        sx = bw / float(disp_w)
+        sy = bh / float(disp_h)
+        px0 = max(0, int(vx0 * sx))
+        py0 = max(0, int(vy0 * sy))
+        px1 = min(bw, max(px0 + 8, int(math.ceil(vx1 * sx))))
+        py1 = min(bh, max(py0 + 8, int(math.ceil(vy1 * sy))))
+        blkW, blkH = px1 - px0, py1 - py0
+
+        _tw, _th, cbgra = thumbs.crop_bgra(bw, bh, bbgra, px0, py0, blkW, blkH)
+        twant = max(16, int(round(blkW / sx)))
+        thwant = max(16, int(round(blkH / sy)))
+
+        # key 里带上 zoom / 视口位置 / 基准尺寸，任一变化就换一块新的
+        pkey = ("tile", path, bw, bh, int(zoom * 1000), px0, py0, blkW, blkH,
+                twant, thwant)
+        img = self.big.photo(pkey)
+        if img is not None:
+            dw, dh = img.width(), img.height()
+        elif blkW * blkH <= self.TILE_SYNC_PX:
+            # 块不大 —— 直接算出来，省得先占位再替换（那样会闪一下）
+            ppm, _pw, _ph = uikit.fit_ppm(blkW, blkH, cbgra, 0)
+            if ppm is None:
+                return False
+            img = tk.PhotoImage(data=ppm, master=self)
+            # ⚠️ 这里必须是 `resample_img`，**不能**用 `fit_img`：
+            #    后者会一路缩到「装得下为止」，把 920 宽的块缩成 683。
+            img = uikit.resample_img(img, twant, thwant, 64.0)
+            self.big.put_photo(pkey, img)
+            dw, dh = img.width(), img.height()
+        else:
+            self._fit_async(col, path, pkey, blkW, blkH, cbgra,
+                            (twant, thwant, 64.0), 0)
+            img, dw, dh = self._placeholder(col, path, twant, thwant)
+        if img is None:
+            return False
+
+        self._keep.append(img)
+        # ⚠️ 别忘了 pad：块是从 vx0 开始的，不是从图的 0,0 开始
+        item = cv.create_image(ox + int(round(px0 / sx)),
+                               oy + int(round(py0 / sy)),
+                               anchor="nw", image=img)
+        self._view[col] = {"cv": cv, "item": item, "ox": ox, "oy": oy,
+                           "px": self.pan[col][0], "py": self.pan[col][1],
+                           "disp": (disp_w, disp_h)}
+        self._render_caption(cap, path, disp_w)
+        if DEBUG:
+            print("[分块] 侧%d %s zoom %.2f 显示 %dx%d 取块 %dx%d -> 画 %dx%d"
+                  % (col, os.path.basename(path), zoom, disp_w, disp_h,
+                     blkW, blkH, dw, dh), file=sys.stderr)
+        return True
+
+    # ---- 空闲预热 --------------------------------------------------------
+    # 主人 2026-10-06：「每组第一次打开会卡顿一下，后面打开就好了，
+    # 不能在加载时，同时加载好吗」—— 可以。一张图要经「解码 -> 编码 ->
+    # 建 Tk 图」三步才能显示，头两步能放后台，最后一步只能主线程做。
+    # 空闲时把排队做完，之后点开哪一组都是现成的。
+    PREWARM_MAX = 60                        # 最多预热这么多张
+    PREWARM_LV = (768, 1536, 3072)          # 缩放要用的基准档（按预算放）
+    # ⚠️ 基准像素**只给排在前面的这些张**准备：一档 1536 就是 6MB，60 张全解
+    # 是 400MB，超预算会来回挤掉、白干。缩放只会发生在「正在看 / 马上要看」
+    # 的那几张上，剩下的备好适应窗口那张成品图就够了（那是「打开卡一下」的
+    # 大头）。排前面的正是当前这两张 + 当前组的图。
+    PREWARM_BASE_MAX = 16
+
+    def _prewarm_start(self):
+        """扫描完 / 布局稳定后，后台把各组要用的图准备好。
+
+        ⚠️ 顺序是**紧着当前会看到的先做**：当前这一组的两张排最前面，
+        否则力气全花在后面的组上，点第一组还是得等。
+        """
+        paths = []
+
+        def add(p):
+            if p and p not in paths:
+                paths.append(p)
+
+        add(self.path_a)
+        add(self.path_b)
+        if self.view == "groups":
+            for g in self.groups:
+                for p in g["members"][:2]:
+                    add(p)
+        for it in self.glist.items:
+            add(it["tag"])
+        # ⚠️ 兜底：一个组都没有时（比如一批互不相干的图），上面三处**全是空的**，
+        #    预热就空转 —— 实测 0 组时队列长度 0、`_b` 一片空白，第一次滚轮
+        #    还得现解 1536 那一档，128ms 就这么来的。
+        for p in (self.files or []):
+            add(p)
+        self._prewarm_q = paths[:self.PREWARM_MAX]
+        if not self._prewarm_q:
+            return
+        # ⚠️ 别在这里清 `_prewarm_busy`：还有线程在跑时把它置 False，
+        #    `_prewarm_tick` 会再起一条 —— 两条后台解码抢 GIL，反而更卡。
+        #    队列重建后由 `_prewarm_done` 接着往下走。
+        # 按**当前画布尺寸**准备，尺寸对了成品图的 key 才对得上
+        cw = max(1, self.cv_a.winfo_width())
+        ch = max(1, self.cv_a.winfo_height())
+        margin = S(8)
+        box = (max(16, cw - margin), max(16, ch - margin))
+        self._prewarm_box = (max(16, box[0] // 16 * 16),
+                             max(16, box[1] // 16 * 16))
+        self._prewarm_n = 0
+        if not getattr(self, "_prewarm_busy", False):
+            self._prewarm_tick()
+
+    def _base_prep(self, col, path, need):
+        """登记「想要哪一档基准像素」，等用户停手了再后台解。
+
+        页面上是先拿粗的那档顶着（几毫秒），解好之后自动换成清晰的。
+
+        ⚠️ **绝不能在用户正滚滚轮的时候起线程**：解一档是几百毫秒的 Python
+        层按行拷贝，会占着 GIL 把主线程饿死 —— 实测那一帧主线程自己的
+        每个环节都没超过 3ms，整帧却被拖到 97ms，全花在等 GIL 上。
+        所以这里只登记，防抖 300ms（连滚 N 格只解最后一次要的那一档）。
+        """
+        lv = self.big._level(need)
+        key = (path, lv)
+        if key in self._base_prep_done or key in getattr(self, "_base_busy", ()):
+            return
+        self._base_want[key] = (col, path, need)
+        self._later("baseprep", 300, self._base_prep_go)
+
+    def _base_prep_go(self):
+        """防抖到期，真的开始解 —— 用户还在动就再往后推。"""
+        if getattr(self, "_prewarm_pause", 0) > time.time():
+            self._later("baseprep", 250, self._base_prep_go)
+            return
+        want = getattr(self, "_base_want", None)
+        if not want:
+            return
+        # 连滚过好几档的话，只有**最后**那一档还用得上，中间的别浪费力气
+        key = list(want)[-1]
+        col, path, need = want.pop(key)
+        want.clear()
+        self._base_busy.add(key)
+
+        def work():
+            try:
+                ok = self.big.base(path, need) is not None
+            except Exception:
+                ok = False
+            self._ui(self._base_prepped, key, col, ok)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _base_prepped(self, key, col, ok):
+        self._base_busy.discard(key)
+        if ok:
+            self._base_prep_done.add(key)
+        cur = self.path_a if col == 0 else self.path_b
+        if cur != key[0] or self.zoom[col] <= 1.001:
+            return                       # 用户已经点走 / 退回适应窗口了
+        self.render_all(precise=True, only=col)
+
+    def _prewarm_yield(self, sec=0.8):
+        """用户在操作（滚轮/点组）—— 预热先让路。
+
+        ⚠️ 后台解码会占着 GIL（读像素那段是 Python 层的按行拷贝），
+        跟它抢的话主线程就被拖住：实测滚轮前两档被拖到 129ms / 84ms。
+        用户一动就暂停一会儿，等他停下来再继续。
+        """
+        self._prewarm_pause = time.time() + sec
+
+    def _prewarm_tick(self):
+        """一次处理一张：**后台**解码 + 编码，回调里只建 Tk 图。"""
+        if getattr(self, "_prewarm_pause", 0) > time.time():
+            self.after(200, self._prewarm_tick)
+            return
+        if self._prewarm_busy or not getattr(self, "_prewarm_q", None):
+            return
+        self._prewarm_busy = True
+        path = self._prewarm_q.pop(0)
+        box = getattr(self, "_prewarm_box", (640, 480))
+        lvs = list(self.PREWARM_LV)
+        n = getattr(self, "_prewarm_n", 0)
+        self._prewarm_n = n + 1
+        want_base = n < self.PREWARM_BASE_MAX
+
+        def work():
+            out = []
+            try:
+                got = self._decode(path, box[0], box[1], 1.0)
+                if got:
+                    w, h, bgra = got
+                    ppm, _pw, _ph = uikit.fit_ppm(w, h, bgra,
+                                                  S(PIC_RADIUS), P.CARD)
+                    Q = 16
+                    pkey = (path, w, h, max(Q, box[0] // Q * Q),
+                            max(Q, box[1] // Q * Q), False)
+                    out.append((pkey, ppm))
+                # 缩放要用的基准档：只给排在前面的几张准备（见 PREWARM_BASE_MAX）
+                if want_base:
+                    wh = META.of(path)["wh"]
+                    top = max(wh) if wh else max(box)
+                    for lv in lvs:
+                        if lv <= top:
+                            self.big.base(path, lv)
+            except Exception:
+                import traceback
+                traceback.print_exc()
+            self._ui(self._prewarm_done, out)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _prewarm_done(self, out):
+        """后台那张回来了 —— 主线程只做「字节 -> Tk 图」这最后一步。"""
+        self._prewarm_busy = False
+        for pkey, ppm in out:
+            try:
+                img = tk.PhotoImage(data=ppm, master=self)
+            except Exception:
+                continue
+            self.big.put_photo(pkey, img)
+            self._keep.append(img)
+        if getattr(self, "_prewarm_q", None):
+            # 每 60ms 才做一张，中间留出空闲，界面不会被拖慢
+            self.after(60, self._prewarm_tick)
+
+    def _render_caption(self, cap, path, disp_w, crop_info=None):
+        """画布上方那行小字（文件名 + 分辨率 / 显示比例）。"""
+        m = META.of(path)
+        wh0 = m["wh"]
+        cap.name_lbl.configure(text=short_name(m["name"], 34))
+        if crop_info is not None:
+            cap.dim_lbl.configure(text=crop_info)
+        elif wh0:
+            pct = 100.0 * disp_w / float(wh0[0])
+            cap.dim_lbl.configure(text="%d × %d · 显示 %.0f%%"
+                                       % (wh0[0], wh0[1], pct))
+        else:
+            cap.dim_lbl.configure(text="解析不了尺寸")
+
     def _render_side(self, col, cv, cap, path, rect, precise=True):
         cw = max(1, cv.winfo_width())
         ch = max(1, cv.winfo_height())
@@ -1707,6 +2226,12 @@ class App(tk.Tk):
         #    照样每次选一组都未命中、都要重编码一遍。
         #    向下取整：解码出来的图只会略小于格子，绝不会溢出被裁。
         box = (max(16, box[0] // 16 * 16), max(16, box[1] // 16 * 16))
+        # ---- 放大后的渲染：走「只取视口那一块」的新路径 ----
+        # 老做法是按 zoom 重新向系统解码一整张更大的图，越放大越贵；
+        # 这里改成分块渲染（见 _render_tile）。返回 True 表示已经画好了。
+        if zoom > 1.001 and not crop:
+            if self._render_tile(col, cv, cap, path, box, zoom, precise):
+                return
         if crop:
             got = self.big.get(path, self._crop_decode_size(path, desc, rect, box))
         elif precise:
@@ -1773,26 +2298,27 @@ class App(tk.Tk):
         ox = (cw - dw) // 2 + self.pan[col][0]
         oy = (ch - dh) // 2 + self.pan[col][1]
         item = cv.create_image(ox, oy, anchor="nw", image=img)
-        self._view[col] = (cv, item, dw, dh, cw, ch)
+        # ox/oy 是**画那一刻**的位置，px/py 是**那一刻**的平移量。
+        # 拖动时只需要在这个基础上加平移的增量，不用重算居中。
+        self._view[col] = {"cv": cv, "item": item, "ox": ox, "oy": oy,
+                           "px": self.pan[col][0], "py": self.pan[col][1],
+                           "disp": (dw, dh)}
 
         m = META.of(path)
         wh0 = m["wh"]
-        cap.name_lbl.configure(text=short_name(m["name"], 34))
         if crop:
             # 裁剪模式画的是匹配区那一块，此时拿整图分辨率说「显示 107%」是误导
             # （看着像整图缩了一半，其实根本不是整图）。改成说清楚「这是哪一块、多大」。
             gw, gh = desc["gw"], desc["gh"]
             rw = max(1, int(round((rect[2] - rect[0]) / float(gw) * wh0[0]))) if wh0 else 0
             rh = max(1, int(round((rect[3] - rect[1]) / float(gh) * wh0[1]))) if wh0 else 0
-            cap.dim_lbl.configure(
-                text=("仅匹配区 %d × %d · 占本图 %.0f%%"
-                      % (rw, rh, 100.0 * rw * rh / float(wh0[0] * wh0[1])))
-                if wh0 else "只看匹配区域")
+            self._render_caption(cap, path, dw,
+                                 crop_info=("仅匹配区 %d × %d · 占本图 %.0f%%"
+                                            % (rw, rh, 100.0 * rw * rh
+                                               / float(wh0[0] * wh0[1])))
+                                 if wh0 else "只看匹配区域")
         else:
-            pct = (dw / float(wh0[0]) * 100.0) if wh0 and wh0[0] else 100.0
-            cap.dim_lbl.configure(
-                text=("%d × %d · 显示 %.0f%%" % (wh0[0], wh0[1], pct))
-                if wh0 else "解析不了尺寸 · 显示 %.0f%%" % pct)
+            self._render_caption(cap, path, dw)
         if DEBUG:
             print("[渲染] 侧%d %s 解码 %dx%d 显示 %dx%d 缩放 %.2f 画布 %dx%d"
                   % (col, os.path.basename(path), w, h, dw, dh, self.zoom[col],

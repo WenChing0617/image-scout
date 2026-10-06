@@ -24,6 +24,7 @@
 import io
 import os
 import re
+import shutil
 import sys
 import tempfile
 import time
@@ -39,6 +40,7 @@ import quarantine           # noqa: E402
 import scan                 # noqa: E402
 import thumbs               # noqa: E402
 import uikit                # noqa: E402
+import winimg               # noqa: E402
 
 # 样本放 %TEMP%，跑测试不会把工程目录弄脏
 SAMPLE_ROOT = os.path.join(tempfile.gettempdir(), "ImageScout-uitest")
@@ -162,14 +164,23 @@ def settle_render(app, timeout=6.0):
             v = app._view.get(col)
             if not v:
                 continue
-            _, item, _dw, _dh, cw, ch = v
-            if (cv.winfo_width(), cv.winfo_height()) != (cw, ch):
-                return False            # 画布又变过，等去抖重绘
+            item = v["item"]                 # 现在是 dict：{画布, 图元, 位置, ...}
+            cw, ch = cv.winfo_width(), cv.winfo_height()
             bb = cv.bbox(item)
             if not bb:
                 return False
-            if bb[0] < -2 or bb[1] < -2 or bb[2] > cw + 2 or bb[3] > ch + 2:
-                return False            # 溢出：要么还没重绘，要么真是 bug
+            # ⚠️ 放大后画布上只有「视口那一块」，它应当盖住「图 ∩ 画布」这一整块。
+            #    所以不能直接要求「图元 == 画布」：<｜hy_place▁holder▁no▁813｜>比 zoom 小时上下本来就该留黑边。
+            disp_w, disp_h = v["disp"]
+            ox = (cw - disp_w) // 2 + app.pan[col][0]
+            oy = (ch - disp_h) // 2 + app.pan[col][1]
+            want = (max(0, ox), max(0, oy),
+                    min(cw, ox + disp_w), min(ch, oy + disp_h))
+            if want[2] <= want[0] or want[3] <= want[1]:
+                return False                 # 图被拖出画布了
+            if bb[0] > want[0] + 2 or bb[1] > want[1] + 2 \
+                    or bb[2] < want[2] - 2 or bb[3] < want[3] - 2:
+                return False                 # 还没铺满（多半是后台还在出图）
         return True
     return pump(app, until=ok, timeout=timeout)
 
@@ -355,6 +366,127 @@ def test_palette():
           "页面与卡片同为纯白（分层交给描边）")
     check(contrast(P.BORDER_HI, P.CARD) >= 1.3, "描边在卡片上看得见")
     check(contrast(P.SHADOW, P.CARD) >= 1.05, "阴影在白底上看得见")
+
+
+BIG_ROOT = os.path.join(tempfile.gettempdir(), "ImageScout-bigtest")
+
+
+def make_huge(path, w=3000, h=2000):
+    """造一张 3000×2000 的 PNG（行 pattern 拼，避免逐像素慢）。
+
+    ⚠️ 之前的流畅度断言全是用 480×360 的小样本跑的，**测不出真实开销**：
+    主人的照片是几千万像素的。4000×3000 的图按老实现缩放一次要 229ms，
+    小样本那边只有几十毫秒 —— 这就是为什么「测试全绿但主人还是觉得卡」。
+    """
+    rows = []
+    for phase in range(8):
+        line = bytearray()
+        for x in range(w):
+            line += bytes(((x + phase * 37) % 256,
+                           (x * 3 + phase * 11) % 256,
+                           (x * 7 + phase * 53) % 256, 255))
+        rows.append(bytes(line))
+    buf = bytearray()
+    for y in range(h):
+        buf += rows[y % 8]
+    with open(path, "wb") as f:
+        f.write(thumbs.bgra_to_png(w, h, bytes(buf)))
+    return path
+
+
+def test_big_zoom():
+    """真实大图的缩放流畅度（单独一个窗口，测完就销毁）。"""
+    print("\n########  大图（3000×2000）缩放  ########")
+    shutil.rmtree(BIG_ROOT, ignore_errors=True)
+    os.makedirs(BIG_ROOT, exist_ok=True)
+    a = make_huge(os.path.join(BIG_ROOT, "big_a.png"))
+    got = winimg.load_pixels(a, 2000, winimg.SIIGBF_RESIZETOFIT, raw=True)
+    w, h, px = got
+    _w, _h, cut = thumbs.crop_bgra(w, h, px, int(w * 0.1), int(h * 0.1),
+                                   int(w * 0.8), int(h * 0.8))
+    with open(os.path.join(BIG_ROOT, "big_b.png"), "wb") as f:
+        f.write(thumbs.bgra_to_png(_w, _h, cut))
+
+    # ⚠️ 上一个窗口刚销毁：模块级的圆角图缓存里还挂着**旧解释器**的
+    #    PhotoImage，直接建第二个窗口会报 image "pyimage1" doesn't exist。
+    uikit.clear_photo_caches()
+    app = ui.App([BIG_ROOT])
+    app.update()
+    app.start_scan()
+    ok = pump(app, until=lambda: not app.busy and bool(app.files), timeout=300)
+    check(ok, "大图样本扫完了（%d 张）" % len(app.files))
+    app.set_view("all")
+    row = next(i for i, it in enumerate(app.glist.items) if it["tag"] == a)
+    app.glist.select(row)
+    app.update()
+    settle_render(app)
+    # 画布尺寸一变预热会重做一遍，所以要等「队列空 + 不在忙」稳定一小会儿
+    def warm_idle():
+        return (not getattr(app, "_prewarm_q", [])
+                and not getattr(app, "_prewarm_busy", False))
+    pump(app, until=warm_idle, timeout=120)
+    settle_render(app)
+    pump(app, until=warm_idle, timeout=120)
+    settle_render(app)
+    print("   画布 %dx%d" % (app.cv_a.winfo_width(), app.cv_a.winfo_height()))
+
+    class Ev(object):
+        def __init__(self, d):
+            self.delta = d
+            self.x = 10
+            self.y = 10
+
+    up, down = [], []
+    for _ in range(8):
+        t0 = time.perf_counter()
+        app._on_wheel(0, Ev(120))
+        app.update()
+        up.append((time.perf_counter() - t0) * 1000)
+        settle_render(app)
+    for _ in range(8):
+        t0 = time.perf_counter()
+        app._on_wheel(0, Ev(-120))
+        app.update()
+        down.append((time.perf_counter() - t0) * 1000)
+        settle_render(app)
+    print("   放大 %s" % " ".join("%.0f" % v for v in up))
+    print("   缩小 %s" % " ".join("%.0f" % v for v in down))
+    # 老实现：放大 130~229ms、缩小 200~342ms；新实现的目标是**跟 zoom 无关**。
+    check(max(up) < 80, "大图放大不卡（最慢 %.0f ms < 80 ms）" % max(up))
+    check(max(down) < 80, "大图缩小不卡（最慢 %.0f ms < 80 ms）" % max(down))
+
+    # 再滚一遍同样的位置：应该几乎不花钱
+    again = []
+    for d in (120, 120, -120, -120):
+        t0 = time.perf_counter()
+        app._on_wheel(0, Ev(d))
+        app.update()
+        again.append((time.perf_counter() - t0) * 1000)
+        settle_render(app)
+    print("   走过的位置再来一次 %.0f~%.0f ms" % (min(again), max(again)))
+    check(max(again) < 40, "重复的位置几乎不花钱（最慢 %.0f ms < 40 ms）"
+          % max(again))
+
+    # 拖动平移：块里带缓冲，纯挪图元应该是 0ms 级
+    app.reset_zoom()
+    app.update()
+    for _ in range(3):
+        app._on_wheel(0, Ev(120))
+    app.update()
+    settle_render(app)
+    app._pan_start(0, Ev(0))
+    kind = type("P", (), {})
+    moves = []
+    for k in range(30):
+        p = kind()
+        p.x, p.y = 300 + (k % 15) * 10, 300 + (k % 11) * 8
+        t0 = time.perf_counter()
+        app._pan_move(0, p)
+        moves.append((time.perf_counter() - t0) * 1000)
+    print("   拖动 %.2f ms/次（最大 %.1f ms）"
+          % (sum(moves) / len(moves), max(moves)))
+    check(max(moves) < 60, "拖动不卡（最慢 %.1f ms < 60 ms）" % max(moves))
+    app.destroy()
 
 
 def main():
@@ -577,12 +709,25 @@ def main():
     check(app.zoom[0] > z0[0], "在左侧滚轮 → 左侧放大（%.2f -> %.2f）" % (z0[0], app.zoom[0]))
     check(abs(app.zoom[1] - 1.0) < 1e-6,
           "右侧**没被动过**（还是 %.2f）—— 这就是「放大鼠标所在那一张」" % app.zoom[1])
+    # ⚠️ 2026-10-06 改成分块渲染之后，画布上不再是「整张放大后的图」，
+    #    而是「视口那一块」——所以不能再断言「图元比画布宽」（那是旧实现的行为）。
+    #    新语义：**图 ∩ 画布** 那一块必须被完整盖住，且显示倍率真的涨上去了。
+    settle_render(app)
+    v = app._view.get(0)
     _, boxes_z = canvas_items(app.cv_a)
-    if boxes_z:
-        wide = boxes_z[0][2] - boxes_z[0][0]
-        check(wide > wa - ui.S(20),
-              "放大后图片超出格子（%d > %d）—— 说明真的解码了更大的图，"
-              "不是把小图硬拉" % (wide, wa - ui.S(20)))
+    if v and boxes_z:
+        disp_w = v["disp"][0]
+        bb = boxes_z[0]
+        need = (max(0, (wa - disp_w) // 2 + app.pan[0][0]),
+                max(0, (ha - v["disp"][1]) // 2 + app.pan[0][1]),
+                min(wa, (wa - disp_w) // 2 + app.pan[0][0] + disp_w),
+                min(ha, (ha - v["disp"][1]) // 2 + app.pan[0][1] + v["disp"][1]))
+        check(bb[0] <= need[0] + 2 and bb[2] >= need[2] - 2,
+              "放大后视口那一块铺满了画布（块 %d..%d ⊇ 需要 %d..%d）"
+              % (bb[0], bb[2], need[0], need[2]))
+        check(disp_w > wa * 1.15,
+              "显示尺寸真的按倍率长大了（%d > %.0f）—— 不是把小图硬拉"
+              % (disp_w, wa * 1.15))
 
     zl = app.zoom[0]
     app._on_wheel(1, _E())
@@ -946,6 +1091,19 @@ def main():
     app.set_view("groups")
     app.update()
     settle_render(app)
+    # 等预热跑完 —— 主人 2026-10-06：「每组第一次打开会卡顿一下，
+    # 不能在加载时同时加载好吗」。预热之后每次点开都该是现成的。
+    warm_ok = pump(
+        app,
+        until=lambda: (not getattr(app, "_prewarm_q", [])
+                       and not getattr(app, "_prewarm_busy", False)),
+        timeout=60)
+    settle_render(app)
+    print("   预热队列跑完：%s（还剩 %d 张）"
+          % (warm_ok, len(getattr(app, "_prewarm_q", []))))
+    check(warm_ok, "空闲预热在 60s 内跑完（后台解码，不占主线程）")
+    check(any(k[0] != "tile" for k in app.big._p),
+          "预热真的产出了成品图（缓存里 %d 张）" % len(app.big._p))
 
     class _Ev(object):
         """假事件对象（hover 只用 y，滚轮只用 delta）。"""
@@ -1034,6 +1192,9 @@ def main():
     print("\n=== 关闭 ===")
     app.destroy()
     check(True, "窗口正常销毁，没有异常")
+
+    # 大图（3000×2000）的缩放单独开一个窗口测 —— 小样本测不出真实开销
+    test_big_zoom()
 
     print("\n=== 汇总 ===")
     if FAIL:

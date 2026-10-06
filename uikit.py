@@ -401,6 +401,19 @@ def draw_rounded(surf: Surface, x, y, w, h, r, *, fill=None, grad=None,
     return (x0, y0, x1, y1)
 
 
+def clear_photo_caches():
+    """清掉按尺寸缓存的圆角底图。
+
+    ⚠️ `tk.PhotoImage` 属于**某一个** Tcl 解释器。这些缓存是模块级的，
+    所以「销毁第一个窗口、再建第二个」时，缓存里还剩着旧解释器的图，
+    拿去给新窗口用就报 `image "pyimage1" doesn't exist`。
+    测试里要建两个窗口（大图缩放单独一个），建之前必须清一次。
+    """
+    _BTN_CACHE.clear()
+    _CARD_CACHE.clear()
+    _ROW_CACHE.clear()
+
+
 def rounded_photo(root, w, h, r, **kw):
     """造一张独立的圆角图（tk.PhotoImage）。"""
     surf = Surface(w, h, kw.pop("page", None))
@@ -481,6 +494,46 @@ def fit_img(img, cw, ch, max_zoom=4.0):
             m += 1
             out = img.subsample(m)
     return out, out.width(), out.height()
+
+
+def resample_img(img, tw, th, max_zoom=64.0):
+    """按目标尺寸**等比**重采样，用有理数 p/q 逼近（Tk 只有整数倍操作）。
+
+    ⚠️ 别拿 `fit_img` 来干这个活：那个函数是给「适应格子」用的，内部有
+    「装不下就继续除」的兜底 —— 实测把目标 920 宽一路缩到 683（少了 26%）。
+    分块渲染要的是「这块该多大就多大」，多出来的一圈由周围的缓冲吃掉。
+
+    做法：找 q ≤ 16 使 p/q 最接近目标比例，然后 **先 subsample(q) 再 zoom(p)**。
+    顺序很重要：反过来的话 zoom 要作用在整块大图上（2048 宽的图放大很贵），
+    先缩小再放大，中间图只有 1/q，快得多。
+    """
+    if img is None:
+        return None
+    w, h = img.width(), img.height()
+    if w <= 0 or h <= 0:
+        return img
+    cw, chh = int(max(16, tw)), int(max(16, th))
+    s = min(cw / float(w), chh / float(h))
+    s = max(1e-3, min(s, float(max_zoom)))
+    if 0.985 <= s <= 1.015:
+        return img
+    best = None
+    for q in range(1, 17):
+        p = int(round(s * q))
+        if p < 1 or p > max_zoom * q:
+            continue
+        err = abs(p / float(q) - s)
+        if best is None or err < best[0]:
+            best = (err, p, q)
+    if best is None:
+        return img
+    _err, p, q = best
+    out = img
+    if q > 1:
+        out = out.subsample(q)
+    if p > 1:
+        out = out.zoom(p)
+    return out
 
 
 def fit_ppm(w, h, bgra, radius=0, page=None):
