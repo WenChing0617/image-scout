@@ -1695,9 +1695,15 @@ class App(tk.Tk):
         cv.coords(info["item"], info["ox"] + (px - info["px"]),
                   info["oy"] + (py - info["py"]))
         self.pan[col][0], self.pan[col][1] = px, py
-        # 离上一次出图超过 80ms 才允许再出一帧
+        # ⚠️⚠️ **露白（缓冲吃光）必须立刻重画，不能等节流**。
+        #    节流是 80ms 一次，而快速拖动 80ms 内能挪 300px+ —— 缓冲只有
+        #    15%（约 150px），等节流的那一帧画面已经空了。实测 40 步拖动
+        #    里 36 步盖不满，最少只盖到 69%，就是这里。
+        #    代价：重画一次 0.6~1.8ms（缓存命中），远比露白难看得多；
+        #    真要更省，可以只在「露白超过一定面积」时才重画。
+        need = self._tile_needs_more(col, cv, px, py)
         now = time.time()
-        if now - self._drag_last >= 0.08 and self._tile_needs_more(col, cv, px, py):
+        if need and now - self._drag_last >= self.PAN_LAG:
             self._drag_last = now
             # ⚠️ 用 **0.75 中间档**，别用 `precise=False`：粗档只有一半分辨率，
             #    拖动全程都是 2~6 倍欠采样 —— 主人反馈「推拽还有马赛克」就是
@@ -1705,22 +1711,32 @@ class App(tk.Tk):
             self.render_all(precise=0.75, only=col)
 
     def _tile_needs_more(self, col, cv, px, py):
-        """平移之后，渲染好的那块还能不能盖住整个画布？（不够就 Fasching 要重取）"""
+        """平移之后，渲染好的那块还能不能盖住整个画布？（不够就得重取）
+
+        ⚠️⚠️ 判据必须用**图元的真实 bbox**，不能用「显示图尺寸 + 平移量」推算。
+        分块渲染之后画布上贴的只是**视口 + 一圈缓冲**那一块，比整张显示图小得多
+        （zoom 1.95 时显示图 2943 宽，块只有 1962）。用显示图算的话永远认为
+        「够覆盖」→ 拖动时从不重取 → 缓冲被吃光后画面就停在旧位置，越拖越少，
+        实测 40 步里 36 步盖不满（主人反馈「拖动图片直接空白」）。
+        """
         info = self._view.get(col)
         if not info:
             return False
         cw = max(1, cv.winfo_width())
         ch = max(1, cv.winfo_height())
-        dw, dh = info["disp"]
-        ox = (cw - dw) // 2 + px
-        oy = (ch - dh) // 2 + py
-        bb = cv.bbox(info["item"])
-        if not bb:
+        item = info.get("item")
+        if item is None:
             return True
-        # 左边/上边露白、右边/下边露白，都算不够
-        return (bb[0] > -1 and ox < -1) or (bb[1] > -1 and oy < -1) \
-            or (bb[2] < cw + 1 and ox + dw > cw + 1) \
-            or (bb[3] < ch + 1 and oy + dh > ch + 1)
+        bb = cv.bbox(item)
+        if not bb:
+            return True                      # 图元没了（被清过）-> 重取
+        # ⚠️ `cv.bbox` 返回的是图元**此刻**的真实位置，而 `_pan_move` 刚用
+        #    `cv.coords` 把它挪到了 (px, py) —— 所以这里**不能再加增量**
+        #    （加了就是平移量算两次，图元会越拖越偏，最后整块跑到画布外面，
+        #    实测bbox 从 -228 一路漂到 +363，覆盖率掉到 69%）。
+        #留 1px 余量：差一点点就当够，别为1px 反复重取。
+        M = 1
+        return (bb[0] > -M) or (bb[1] > -M) or (bb[2] < cw + M) or (bb[3] < ch + M)
 
     def _pan_end(self):
         self._drag = None
@@ -1756,10 +1772,18 @@ class App(tk.Tk):
         重新编码一遍）；此时 **不清** `_keep` / `_view`，另一侧的画面原样保留。
         `precise=False` 是滚轮快速档：只用缓存里已有的解码图顶上，
         不同步重解 —— 连滚时每格都解大图就是「缩放好卡」的根源。
+
+        ⚠️ `only=None`（切组 / 换图 / 窗口变化）会把 `_view` 清空，这一侧
+        **必须**先清画布 —— 旧图留着会跟新图叠在一起。`only=col`（滚轮、
+        拖动）保留 `_view`，`_render_side` 就会在贴新图元前才清 —— 中途
+        return 也不会留下空画布（主人反馈「拖动图片直接空白」的修法）。
         """
         if only is None:
             self._keep = []
             self._view = {}
+            self.cv_a.delete("all")
+            if self.mode == "pair":
+                self.cv_b.delete("all")
         self._render_side(0, self.cv_a, self.cap_a, self.path_a, self.rect_a,
                           precise)
         if only is None or only == 1:
@@ -1911,14 +1935,35 @@ class App(tk.Tk):
     #    显示图小」的那部分），zoom 2.44 那档实测 367 万像素、编码 152ms ——
     #    清晰度够了但卡。0.15 约 1.7 倍，编码砍到四成。滑出缓冲也只是
     #    80ms 节流后补一帧，松手还会补一张精确帧。
-    TILE_PAD = 0.15
-    # 块比这个还大就丢后台做，主线程先顶占位。
+    # ⚠️ 0.30 时块面积是**视口的 3.4 倍**（(1+2×0.30)²，再乘上「视口比
+    #    显示图小」的那部分），zoom 2.44 那档实测 367 万像素、编码 152ms ——
+    #    清晰度够了但卡。
+    # 实测（真实照片，3000×2000 拖动 40 步，零露白的前提下）：
+    #    0.15 → 最慢 121ms    0.10 → 100ms    0.08 → 91ms
+    # 取 0.10：每边留 150px 缓冲，快速甩鼠标也不露；0.08 只留 121px，
+    # 省下的 9ms 不值得赌一次露白。块面积约视口的 1.44 倍。
+    TILE_PAD = 0.10    # 块比这个还大就丢后台做，主线程先顶占位。
     # ⚠️ 原来定在 50 万（那时块是从**粗档**裁的，尺寸估不准）。现在基准档
     #    跟显示尺寸对齐之后，块的大小只跟**视口**有关：实测 70~150 万像素
     #    的块，同步编码只要 8.7~18.5ms，整帧 28~35ms。反而是这个阈值太紧，
     #    让滚动时常常走异步、屏幕上顶的是占位图 —— 那比糊更难看。
-    #    提到 160 万：常见的块都能同步画完，不闪。
-    TILE_SYNC_PX = 1600000
+    # 提到 160 万之后，滚轮中间那几档（块 240~276 万像素）又落回异步 ——
+    # 实测整帧 114~119ms，其中 `fit_ppm` 34ms 全在**后台线程**（主线程只花
+    # `crop 14 + resample 9`）；但那 20ms 里屏幕上顶的是一张**糊的占位图**，
+    # 而滚轮每 100ms 就换一档，占位图永远等不到替换它的那一帧就被顶掉 ——
+    # 主人看到的就是**全程马赛克**（滚轮快速帧实测欠采样 1.29~1.65 倍）。
+    # 提到 300 万：滚轮和拖动一律同步画完。实测（噪声图，最坏情况）同步
+    # 一帧 60~80ms、异步只要 20ms —— 慢 3 倍换全程清晰，这笔账划算，
+    # 主人明确说了「放大还有马赛克」不能忍。松手后的精确帧不受影响。
+    TILE_SYNC_PX = 3000000
+
+    # 拖动补块的最小间隔（秒）。
+    # ⚠️ 原来硬编码 0.08s，**这是拖动露白的主因之一**：80ms 内快速拖动能挪
+    #    300px+，而缓冲只有视口的 15%（约 150px）—— 等到节流放行，画面已经
+    #    空了一片（实测 40 步里 36 步盖不满，最少 69%）。
+    #    实测缓存命中的重画只要 **0.6~1.8ms**，20ms 已经很宽裕；
+    #    真解不出的那一档走 `_fit_async` 异步，天然不阻塞。
+    PAN_LAG = 0.02
 
     def _render_tile(self, col, cv, cap, path, box, zoom, precise=True):
         """zoom>1：只渲染视口那一块。
@@ -1995,6 +2040,22 @@ class App(tk.Tk):
                 got = self.big.peek_any(path)      # 手上有哪一档就用哪一档
             if got is None:
                 return False                        # 手上空的：交给精确帧
+            # ⚠️⚠️ **拿到的那一档必须真的够清楚**，否则滚轮/拖动全程是马赛克。
+            #    `peek_best` 只给「不超过 want 的最大档」，而档位表**必然有缺口**
+            #    （BASE_STEP=256，3000 宽的图有 2304 这一档吗？没有）——
+            #    实测它在 need_side=2943、precise=0.75 时会退到 **1536**，
+            #    明明手上有 2048/2560/3000，却拿 1536 去填 2943 宽的显示区，
+            #    **1.9 倍欠采样** = 主人说的「放大还有马赛克」（滚轮快速帧
+            #    实测 1.29~1.65 倍）。这里补一刀：欠采样超 1.15 就升档。
+            #
+            #    ⚠️ 升到「刚好够 need_side」那一档（peek_base）就够了，**不要
+            #    再往上要最清晰的**：基准档越高块越大，编码越慢
+            #    （2560 档的块 276 万像素 → 编码 130ms，滚轮中间三档实测
+            #    94/130/120ms就是这么来的）。松手后的精确帧会去解最清晰那档。
+            if max(got[0], got[1]) * 1.15 < need_side:
+                up = self.big.peek_base(path, need_side, native)
+                if up is not None and max(up[0], up[1]) > max(got[0], got[1]):
+                    got = up
         if not got:
             return False
         bw, bh, bbgra = got
@@ -2046,6 +2107,9 @@ class App(tk.Tk):
 
         self._keep.append(img)
         # ⚠️ 别忘了 pad：块是从 vx0 开始的，不是从图的 0,0 开始
+        # ⚠️ 清空挪到这里：只有**真要贴新图元时**才清画布，中途任何 return
+        #    都保留上一帧（见 `_render_side` 开头那段注释 —— 拖动露白的主因）
+        cv.delete("all")
         item = cv.create_image(ox + int(round(px0 / sx)),
                                oy + int(round(py0 / sy)),
                                anchor="nw", image=img)
@@ -2055,7 +2119,8 @@ class App(tk.Tk):
                            # 记下这一帧是用**哪一级基准**画的，以及块多大 ——
                            # 「放大后有没有马赛克」就是看这两个：
                            # 显示宽 / 块宽 > 1.5 就是欠采样（肉眼可见的糊）。
-                           "base": (bw, bh), "blk": (blkW, blkH)}
+                           "base": (bw, bh), "blk": (blkW, blkH),
+                           "img": img}
         self._render_caption(cap, path, disp_w)
         if DEBUG:
             print("[分块] 侧%d %s zoom %.2f 显示 %dx%d 取块 %dx%d -> 画 %dx%d"
@@ -2263,10 +2328,16 @@ class App(tk.Tk):
     def _render_side(self, col, cv, cap, path, rect, precise=True):
         cw = max(1, cv.winfo_width())
         ch = max(1, cv.winfo_height())
-        cv.delete("all")
+        # ⚠️⚠️ **先不清空画布**。这条渲染路径有多个 `return`（取不到档、
+        #    `fit_ppm` 失败、占位图也拿不到）—— 任何一条都会留下一个**空画布**。
+        #    主人反馈「拖动的时候图片直接空白了」就是这个：拖动补块传的是
+        #    快速档，手上没档就 return 了，而画布已经被 `delete("all")` 清空。
+        #    现在改成「真正要贴新图元的那一刻才清」，中间一律保留上一帧 ——
+        #    宁可停一帧不动，也绝不让画面空掉。
         cap.name_lbl.configure(text="")
         cap.dim_lbl.configure(text="")
         if not path:
+            cv.delete("all")
             cv.create_text(cw // 2, ch // 2,
                            text="左边选一组 / 选一张，这里立刻并排对比",
                            fill=P.TEXT_3, font=self.f_small)
@@ -2305,6 +2376,7 @@ class App(tk.Tk):
             if not got:
                 return
         if not got:
+            cv.delete("all")          # 要显示错误文字了，旧图得让位
             cv.create_text(cw // 2, ch // 2, text="读不出这张图\n（%s）"
                            % META.of(path)["format"], fill=P.WARN_D,
                            font=self.f_small, justify="center")
@@ -2353,18 +2425,21 @@ class App(tk.Tk):
                             (wq, hq, want[2]), radius)
             img, dw, dh = self._placeholder(col, path, want[0], want[1])
         if img is None:
+            cv.delete("all")          # 要显示错误文字了，旧图得让位
             cv.create_text(cw // 2, ch // 2, text="这张图显示不了",
                            fill=P.WARN_D, font=self.f_small)
             return
         self._keep.append(img)
         ox = (cw - dw) // 2 + self.pan[col][0]
         oy = (ch - dh) // 2 + self.pan[col][1]
+        # ⚠️ 清空挪到这里（见 `_render_side` 开头）：只有真要贴新图元才清
+        cv.delete("all")
         item = cv.create_image(ox, oy, anchor="nw", image=img)
         # ox/oy 是**画那一刻**的位置，px/py 是**那一刻**的平移量。
         # 拖动时只需要在这个基础上加平移的增量，不用重算居中。
         self._view[col] = {"cv": cv, "item": item, "ox": ox, "oy": oy,
                            "px": self.pan[col][0], "py": self.pan[col][1],
-                           "disp": (dw, dh)}
+                           "disp": (dw, dh), "img": img}
 
         m = META.of(path)
         wh0 = m["wh"]

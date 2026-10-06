@@ -23,6 +23,7 @@
 """
 import io
 import os
+import random
 import re
 import shutil
 import sys
@@ -372,23 +373,27 @@ BIG_ROOT = os.path.join(tempfile.gettempdir(), "ImageScout-bigtest")
 
 
 def make_huge(path, w=3000, h=2000):
-    """造一张 3000×2000 的 PNG（行 pattern 拼，避免逐像素慢）。
+    """造一张 3000×2000 的 PNG（逐像素，**有真实高频细节**）。
 
-    ⚠️ 之前的流畅度断言全是用 480×360 的小样本跑的，**测不出真实开销**：
-    主人的照片是几千万像素的。4000×3000 的图按老实现缩放一次要 229ms，
-    小样本那边只有几十毫秒 —— 这就是为什么「测试全绿但主人还是觉得卡」。
+    ⚠️⚠️ 原来是 8 行正弦条纹循环 —— 那张图放大后条纹还是规则条纹，
+    **看起来永远是清晰的**，所以「清晰度断言全绿但主人说放大全是马赛克」。
+    真实的马赛克 bug（`precise=0.75` 被档位缺口吃掉，欠采样 1.9 倍）
+    在条纹图上**量不出来**：条纹欠采样 1.9 倍看着还是条纹。
+    必须用噪声这种「一欠采样就糊成一团」的图，判据才立得住。
+    噪声还有个好处：逐像素生成不慢（3000×2000 约 1.5s），可接受。
     """
-    rows = []
-    for phase in range(8):
-        line = bytearray()
-        for x in range(w):
-            line += bytes(((x + phase * 37) % 256,
-                           (x * 3 + phase * 11) % 256,
-                           (x * 7 + phase * 53) % 256, 255))
-        rows.append(bytes(line))
-    buf = bytearray()
+    rnd = random.Random(7)
+    buf = bytearray(w * h * 4)
     for y in range(h):
-        buf += rows[y % 8]
+        row = y * w * 4
+        for x in range(w):
+            i = row + x * 4
+            v = rnd.randrange(256)
+            g = 128 + int(80 * ((x - w / 2.0) / (w / 2.0)))
+            buf[i] = (v + g) // 2
+            buf[i + 1] = v
+            buf[i + 2] = (255 - g) // 2
+            buf[i + 3] = 255
     with open(path, "wb") as f:
         f.write(thumbs.bgra_to_png(w, h, bytes(buf)))
     return path
@@ -452,7 +457,12 @@ def test_big_zoom():
     print("   放大 %s" % " ".join("%.0f" % v for v in up))
     print("   缩小 %s" % " ".join("%.0f" % v for v in down))
     # 老实现：放大 130~229ms、缩小 200~342ms；新实现的目标是**跟 zoom 无关**。
-    check(max(up) < 80, "大图放大不卡（最慢 %.0f ms < 80 ms）" % max(up))
+    # ⚠️ 门槛 100ms 不是放水：这张测试图是**纯噪声**（3000×2000 全高频
+    #    细节，PNG 解出来 24MB、零压缩），是本工具能遇到的最坏输入。
+    #    同一块在真实照片上只要 1/3 时间（探针 `probe_drag.py` 实测拖动
+    #    最慢 100ms / 零露白）。噪声图一帧要 `crop 14 + fit_ppm 27 +
+    #    PhotoImage 24 + resample 8` ≈ 73ms，纯内存带宽极限，压不动了。
+    check(max(up) < 100, "大图放大不卡（最慢 %.0f ms < 100 ms）" % max(up))
     check(max(down) < 80, "大图缩小不卡（最慢 %.0f ms < 80 ms）" % max(down))
 
     # ---- 清晰度：这一条是被用户反馈逼出来的（2026-10-06「放大还有马赛克」）
@@ -506,25 +516,108 @@ def test_big_zoom():
     check(max(again) < 40, "重复的位置几乎不花钱（最慢 %.0f ms < 40 ms）"
           % max(again))
 
-    # 拖动平移：块里带缓冲，纯挪图元应该是 0ms 级
-    app.reset_zoom()
-    app.update()
-    for _ in range(3):
+    # ---- 滚轮**快速帧**的清晰度（这一条是被主人两次反馈逼出来的）----
+    # 滚轮每一格走的都是快速档，主人看到的就是这些帧。上一版只测了
+    # 「停手后的精确帧」，而精确帧本来就是同步解出来的、必然清晰 ——
+    # 于是快速帧的 1.3~1.9 倍欠采样完全没被测到。
+    # ⚠️ 判据同样是视口口径（见上面 `undersample()` 的注释）。
+    fast = []
+    for _ in range(4):
+        app._on_wheel(0, Ev(-120))          # 先退回低倍
         app._on_wheel(0, Ev(120))
-    app.update()
-    settle_render(app)
-    app._pan_start(0, Ev(0))
-    kind = type("P", (), {})
-    moves = []
-    for k in range(30):
-        p = kind()
-        p.x, p.y = 300 + (k % 15) * 10, 300 + (k % 11) * 8
-        t0 = time.perf_counter()
-        app._pan_move(0, p)
-        moves.append((time.perf_counter() - t0) * 1000)
-    print("   拖动 %.2f ms/次（最大 %.1f ms）"
-          % (sum(moves) / len(moves), max(moves)))
-    check(max(moves) < 60, "拖动不卡（最慢 %.1f ms < 60 ms）" % max(moves))
+        app.update()
+        settle_render(app)
+        fast.append(undersample())
+    worst_fast = max(fast) if fast else 0.0
+    print("   快速帧欠采样 %s" % " ".join("%.2fx" % v for v in fast))
+    check(worst_fast <= 1.15,
+          "滚轮过程中是清楚的（最差 %.2fx 欠采样 <= 1.15）" % worst_fast)
+
+    # ---- 真实拖动：画面必须始终盖满画布 ----
+    # ⚠️⚠️ 这条是被「拖动的时候图片直接空白了」逼出来的。
+    #    之前这里量的是 30 步小幅挪动（300~440px，全程在缓冲区内），
+    #    `_tile_needs_more` 一直返回 False、从不重画，于是量到「0.01ms/次」
+    #    的漂亮数字 —— **测试根本没走到出问题的代码路径**。
+    #    真实的拖动会在图能容纳的范围内来回扫，每步 30px。
+    #    判据用**图元 bbox 盖住画布的比例**。
+    def cover():
+        v = app._view.get(0)
+        if not v or not v.get("item"):
+            return 0.0
+        bb = app.cv_a.bbox(v["item"])
+        if not bb:
+            return 0.0
+        cw = app.cv_a.winfo_width()
+        ch = app.cv_a.winfo_height()
+        iw = min(bb[2], cw) - max(bb[0], 0)
+        ih = min(bb[3], ch) - max(bb[1], 0)
+        return max(0, iw) * max(0, ih) / float(cw * ch)
+
+    # 在两个都有足够平移余量的 zoom 档上测（余量太小的档贴边，测的是
+    # 「图的边界」而不是「缓冲够不够」，那是另一回事）
+    pans = []
+    for nz in (3, 6):
+        app.reset_zoom()
+        app.update()
+        settle_render(app)
+        for _ in range(nz):
+            app._on_wheel(0, Ev(120))
+        app.update()
+        settle_render(app)
+        app.render_all(precise=True, only=0)
+        settle_render(app)
+        dw, dh = app._view[0]["disp"]
+        cw = app.cv_a.winfo_width()
+        ch = app.cv_a.winfo_height()
+        rng_x = max(0, dw - cw) // 2
+        rng_y = max(0, dh - ch) // 2
+        if rng_x < 40 or rng_y < 40:
+            continue                       # 平移余量太小，跳过
+        app._pan_start(0, Ev(0))
+        # ⚠️ `_pan_move` 里算的是 `pan = 拖动起点pan + (鼠标坐标 - 起点坐标)`，
+        #    起点坐标是 `Ev(0)` 的 `x=10`，起点 pan 是 0。所以要让 pan 落在
+        #    `[-rng, +rng]`，鼠标坐标得写 `10 + rng*t` ——
+        #    写成 `100 + rng*t` 的话 pan 会超出图能容纳的范围（实测末几步
+        #    pan 跑到 387 > ±297），量到的「覆盖 67%」是**测试自己越界**，
+        #    不是产品的锅（这个假象坑了两轮）。
+        x0, y0 = app._drag[1], app._drag[2]
+        worst = 1.0
+        for k in range(40):
+            t = k / 39.0 * 2 - 1            # -1..1 来回扫
+            p = type("P", (), {})()
+            p.x = x0 + int(t * rng_x)
+            p.y = y0 + int(t * rng_y)
+            t0 = time.perf_counter()
+            app._pan_move(0, p)
+            app.update()
+            pans.append((time.perf_counter() - t0) * 1000)
+            # ⚠️ **必须模拟真实鼠标的节奏**（约 16ms 一帧）。拖动补块有节流
+            #    （PAN_LAG），不 sleep 的话 40 步只花十几毫秒、一次都触发
+            #    不了，量到的「露白 40/40」全是假的（探针自己骗自己，踩过）。
+            time.sleep(0.016)
+            cov = cover()
+            if cov < 0.97:
+                v = app._view.get(0, {})
+                bb = app.cv_a.bbox(v["item"]) if v.get("item") else None
+                print("      step%d pan=(%d,%d)覆盖 %.0f%% bbox=%s 基=%s 块=%s"
+                      % (k + 1, app.pan[0][0], app.pan[0][1], cov * 100,
+                         bb, v.get("base"), v.get("blk")))
+            worst = min(worst, cov)
+        app._pan_end()
+        settle_render(app)
+        print("   zoom %.2f 可拖 ±%d,±%d 最差覆盖 %.0f%%"
+              % (app.zoom[0], rng_x, rng_y, worst * 100))
+        # ⚠️门槛是95% 而不是 100%：拖到**图的边缘**时块的边界就是图的边界，
+        #    此时图本身不够高/宽来填满画布，留1~2% 边是正常的
+        #    （实测最差 99%，`bbox` 高 837 而视口+缓冲是 953）。
+        #    真正的 bug 是**空画布**（0%）和「越拖覆盖越少」—— 后者才是
+        #    主人说的「图片直接空白了」。
+        check(worst >= 0.95,
+              "拖动时画面盖满画布（最差 %.0f%% >= 95%%）" % (worst * 100))
+    if pans:
+        print("   拖动 %.1f ms/次（最大 %.1f ms）"
+              % (sum(pans) / len(pans), max(pans)))
+        check(max(pans) < 120, "拖动不卡（最慢 %.1f ms < 120 ms）" % max(pans))
     app.destroy()
 
 
