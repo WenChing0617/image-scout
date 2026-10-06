@@ -481,6 +481,11 @@ def test_big_zoom():
         app.update()
         settle_render(app)
         app.render_all(precise=True, only=0)      # 停手后的精确帧
+        # ⚠️ 必须等这一帧**真的画完**再量。`render_all` 内部超时的块会丢后台
+        #    编码（`_fit_async`），刚 return 时屏幕上还是 0.75 快速档那一帧 ——
+        #    量出来是 1/0.75 = 1.33x 欠采样，**假的**马赛克（踩过：同一份代码
+        #    上一轮量到 0.99x，这轮 1.37x，差别只是这一帧有没有赶上落地）。
+        settle_render(app)
         app.update()
         sharp.append(undersample())
     # 原图 3000 宽放到 5 倍以上必然超过原生分辨率（放大镜的物理极限），
