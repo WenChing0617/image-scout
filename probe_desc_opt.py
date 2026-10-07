@@ -34,9 +34,50 @@ if HERE not in sys.path:
 
 import crops                         # noqa: E402
 import scan                          # noqa: E402
+import thumbs                        # noqa: E402
 import winimg                        # noqa: E402
 
 ROOT = os.path.join(os.environ.get("TEMP", "."), "ImageScout-prog")
+POOL_N = 40
+
+
+def _make_photo(path, w, h, seed):
+    """8x8 色块图（和 `probe_prog.make_photo` 同一种，等价性不挑图像内容）。"""
+    rnd = random.Random(seed)
+    buf = bytearray(w * h * 4)
+    gw, gh = 8, 8
+    cols = [(rnd.randrange(40, 216), rnd.randrange(40, 216),
+             rnd.randrange(40, 216)) for _ in range(gw * gh)]
+    for y in range(h):
+        by = (y * gh) // h
+        rb = y * w * 4
+        for x in range(w):
+            c = cols[by * gw + ((x * gw) // w)]
+            i = rb + x * 4
+            buf[i], buf[i + 1], buf[i + 2], buf[i + 3] = c[2], c[1], c[0], 255
+    with open(path, "wb") as f:
+        f.write(thumbs.bgra_to_png(w, h, bytes(buf)))
+
+
+def ensure_pool():
+    """池子不在就自己造。
+
+    ⚠️⚠️ 本探针原来直接 `os.listdir(ROOT)`，**依赖「%TEMP% 里恰好有个
+    ImageScout-prog 目录且有图」**（那是 `probe_prog.py` 的池）。
+    v1.12 清理 TEMP 时把池删了，探针立刻 `FileNotFoundError` 崩掉 ——
+    **探针不该依赖外部目录的内容**，自给自足才不会因为清理而假红。
+    """
+    try:
+        if os.path.isdir(ROOT) and len(os.listdir(ROOT)) >= POOL_N:
+            return
+    except OSError:
+        pass
+    os.makedirs(ROOT, exist_ok=True)
+    for i in range(POOL_N):
+        p = os.path.join(ROOT, "p%04d.png" % i)
+        if not os.path.isfile(p):
+            _make_photo(p, 400, 300, i // 8)
+    print("   [池] 自建 %d 张 %s" % (POOL_N, ROOT))
 
 FAIL = []
 OK = []
@@ -242,6 +283,7 @@ def case_speed(n_img=60):
 
 def main():
     print("== crops.describe 优化：等价性 + 提速 ==\n")
+    ensure_pool()
     case_region_gray()
     case_dct()
     case_real()

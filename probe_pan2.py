@@ -319,9 +319,21 @@ def main():
                 print("             %-22s n=%3d 合计 %7.1f  最大 %6.1f"
                       % (_n, len(_v), sum(_v), _v[-1]))
             del _AFTER_LOG[:]
-        results[name] = (pct(times, .5), pct(times, .95), max(times),
+        # ⚠️⚠️⚠️ v1.12：**把「补块帧」从 p95 里剔出去**（判据处的长注释讲原因）。
+        #   `times[i]` 配的是**第 i+1 步**：第 0 步没进 `times`（`_t0_wall`
+        #   还是 None 时跳过），而 `_item_steps` 从第 0 步就开始记 —— 错开一格，
+        #   弄反了就会「用第 i 步的耗时配第 i+1 步的补块标志」。
+        _plain, _pad = [], []
+        for _i, _t in enumerate(times):
+            _j = _i + 1
+            if _j < len(_item_steps):
+                (_pad if _item_steps[_j] else _plain).append(_t)
+        _p95p = pct(_plain, .95) if _plain else pct(times, .95)
+        _padmax = max(_pad) if _pad else 0.0
+        results[name] = (pct(times, .5), _p95p, max(times),
                          nredraw, total, min(covs), worst_slack,
-                         tuple(app.pan[0]))
+                         tuple(app.pan[0]),
+                         pct(times, .95), _padmax, len(_pad))
         # ⚠️ slack 为负时必须**当场自证**：是「真露白」还是「图的边」
         #   （不印出来就会把图的边误判成产品 bug，我在这上面冤枉过一次）
         _note = ""
@@ -332,10 +344,12 @@ def main():
                      "图在画布 y[%d,%d] 视口高 %d]"
                      % (_o, str(_bb), str(_v.get("disp")),
                         _v.get("oy", 0), _v.get("oy", 0) + _v["disp"][1], ch))
-        print("  方向 %s：p50=%.1f p95=%.1f max=%.1f  补块 %d/%d  "
-              "最差覆盖 %.0f%%  最小 slack %d  终点 pan=%s%s"
-              % (name, results[name][0], results[name][1], results[name][2],
-                 nredraw, total, min(covs) * 100, worst_slack,
+        print("  方向 %s：p50=%.1f  **普通帧 p95=%.1f**  补块帧 %d 次 max=%.1f  "
+              "全部帧 p95=%.1f  max=%.1f  补块 %d/%d  最差覆盖 %.0f%%  "
+              "最小 slack %d  终点 pan=%s%s"
+              % (name, results[name][0], results[name][1], len(_pad), _padmax,
+                 pct(times, .95), max(times), nredraw, total,
+                 min(covs) * 100, worst_slack,
                  str(tuple(app.pan[0])), _note))
 
     # ---- 补块门槛必须从**真实补块周期**推，不能拍 ----
@@ -364,10 +378,10 @@ def main():
     print("\n=== 四方向对比（每方向 %d 步，步长 %dpx，路程 %d px）==="
           % (total, STEP, span_y))
     print()
-    print("方向   p50    p95     max  补块/步最差覆盖  最小slack")
+    print("方向   p50  普通p95  补块max  补块次  补块/步  最差覆盖  最小slack")
     bad = []
     for name, _, _ in DIRS:
-        p50, p95, mx, nr, tt, cov, sl, _pan = results[name]
+        p50, p95, mx, nr, tt, cov, sl, _pan, all95, padmax, npad = results[name]
         # 逐方向：横拖用 x 行程 / x 缓冲，竖拖用 y 行程 / y 缓冲
         if name in ("右", "左"):
             _s, _o = span_x, _padx
@@ -480,8 +494,32 @@ def main():
         #⚠️ 门槛历史：120 -> 140 -> 260/300 -> 60 -> **40**。
         #   前三次都是「看单次数据拍的」，两次卡在分布中间；
         #   这次是**先有注入数据、再取空档中点**。
+        #
+        # ⚠️⚠️⚠️ **v1.12：以上「补块帧够不到 p95」是个巧合，已改成显式分判。**
+        #
+        # 上面那段结论（「补块只有 4~9 次 < 5%，p95 够不着」）本身没错，
+        # 但它把判据**绑在了一个随环境变化的前提上** —— 补块次数由**视口尺寸**
+        # 决定，而视口尺寸会跟着窗口/信息卡高度变。实测（同一份代码，
+        # 只把信息卡从 162px 改成 196px，视口 757 -> 723）：
+        #
+        #   视口 757：上方向 6/115 慢帧 (5.0%)  全部帧 p95=32.0   ✅
+        #   视口 723：上方向 6/106 慢帧 (5.7%)  全部帧 p95=110.3  ❌
+        #
+        # **慢帧个数（6）、max（136 vs 133）、补块次数（7）三项完全一样** ——
+        # 只有总步数从 115 变 106。也就是说：没有性能回归，纯粹是 6/106 > 5%
+        # 让 p95 够到了补块帧。这种判据会让「用户拖一下窗口大小」都能翻转结果。
+        #
+        # ✅ 正确口径：**补块帧本来就是慢的**（要解码 + 缩放 + 上屏），
+        #    它不是 bug。主人抱怨的「拖不流畅」指的是普通帧跟不跟手。
+        #    所以拆成两条，都要过：
+        #      · 普通帧 p95 <= 40ms  —— 「跟手」这一条，门槛沿用原来的 40
+        #      · 补块帧 max <= 200ms —— 补块帧也不能慢到肉眼可见的停顿
+        #    两条一起看，覆盖面和原来一样：普通帧变慢 -> 上条红；
+        #    补块变慢/变多 -> 下条红（补块变多由 `nr > _lim2` 兜着）。
         if p95 > 40:
-            flag += "❌拖动尾部失控(p95=%.0fms>40) " % p95
+            flag += "❌普通帧不够跟手(p95=%.0fms>40) " % p95
+        if padmax > 200:
+            flag += "❌补块帧太慢(%.0fms>200) " % padmax
         # ⚠️ `max` 保留但只兜「真·极端单帧」，门槛放到 **500**。
         #   实测基线 max 在 **114~190ms** 飘（3 次 × 4 向，噪声 76ms）——
         #   跟第 16章讲的一样，**极值噪声太大，不适合当主判据**。
@@ -497,8 +535,8 @@ def main():
             flag += "❌露白 "
         if flag:
             bad.append(name + flag)
-        print("%s %6.1f  %6.1f  %6.1f  %3d/%-3d %6.0f%%  %5d  %s"
-              % (name, p50, p95, mx, nr, tt, cov * 100, sl, flag))
+        print("%s %6.1f  %7.1f  %7.1f  %5d  %3d/%-3d  %6.0f%%  %7d  %s"
+              % (name, p50, p95, padmax, npad, nr, tt, cov * 100, sl, flag))
     app.destroy()
     if bad:
         print("\n❌ 有问题的方向：")

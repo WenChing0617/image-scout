@@ -104,6 +104,18 @@ def main():
         app._close_help()
         pump(app, 0.6)
 
+    # ---- v1.12：信息卡排版（分辨率+大小放大、独立一行） -----------------
+    # ⚠️ 信息卡只在看图（pair / 单图）下才填内容，扫描列表模式是空的。
+    fs = list(app.files)[:2]
+    if len(fs) >= 2:
+        app.set_pair(fs[0], fs[1])
+        pump(app, 4.0)                     # 等首帧 + NIQE 那行填完
+        app.update_idletasks()
+        w, h = uishot.grab_widget(app, app.info_card,
+                                  "%s-8-info.png" % prefix,
+                                  margin=uikit.sc(6))
+        print("   %dx%d -> %s-8-info.png" % (w, h, os.path.basename(prefix)))
+
     # ---- 单独抓一条窄列表：下拉条只有 7px，整窗截图缩放后根本看不清 ----
     import tkinter as tk                     # noqa: E402
     top = tk.Toplevel(app)
