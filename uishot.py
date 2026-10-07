@@ -87,8 +87,17 @@ class BITMAPINFO(ctypes.Structure):
                 ("bmiColors", RGBQUAD * 1)]
 
 
-def grab(hwnd, path):
-    """把窗口 hwnd 抓成 PNG 写到 path。返回 (宽, 高)。"""
+def grab(hwnd, path, box=None):
+    """把窗口 hwnd 抓成 PNG 写到 path。返回 (宽, 高)。
+
+    `box=(x, y, w, h)` 可选：只保留这一块（坐标是**根窗口相对**的物理像素）。
+
+    ⚠️⚠️ 想抓「工具栏那一条」**只能走 box**：`GetAncestor(GA_ROOT)` 会把
+       任何子控件的句柄换成根窗口 —— 直接 `grab(line2.winfo_id(), ...)`
+       抓出来还是整窗（2150×1346），子控件坐标全被丢掉。
+        裁之前先把整窗抓下来，再按 `控件.winfo_rootx() - 根.winfo_rootx()`
+       算偏移切行。别指望 PrintWindow 支持「只画一块」。
+    """
     hwnd = user32.GetAncestor(hwnd, 2)          # GA_ROOT
     rc = (ctypes.c_long * 4)()
     if not user32.GetWindowRect(hwnd, ctypes.byref(rc)):
@@ -124,9 +133,51 @@ def grab(hwnd, path):
     data = bytearray(buf.raw)
     for i in range(3, len(data), 4):            # GDI 留下的 alpha 全是 0，补满
         data[i] = 255
+
+    if box is not None:
+        bx, by, bw, bh = (int(v) for v in box)
+        bx = max(0, min(w - 1, bx))
+        by = max(0, min(h - 1, by))
+        bw = max(1, min(bw, w - bx))
+        bh = max(1, min(bh, h - by))
+        out = bytearray()
+        for yy in range(by, by + bh):
+            s = yy * w * 4 + bx * 4
+            out += data[s:s + bw * 4]
+        data, w, h = out, bw, bh
+
     with open(path, "wb") as f:
         f.write(thumbs.bgra_to_png(w, h, bytes(data)))
     return w, h
+
+
+def grab_widget(root, widget, path, margin=8, span=0, extra_w=0):
+    """抓 `root` 窗口里某个**子控件**那一块（含四周 margin），返回 (宽, 高)。
+
+    ⚠️⚠️ 偏移必须自己算，`grab` 的默认行为在这里是错的：
+      · `PrintWindow` 只能整窗抓，图像起点是**窗口左上角**（含标题栏和边框）；
+      · 而 `widget.winfo_rootx/rooty` 是**客户区相对**坐标（Tk 报的）。
+      两者差一圈非客户区 —— 实测 2150×1346 的图 vs 2128×1290 的客户区，
+      横 11、纵 45。直接用 winfo 坐标当 box 会整体上移一个标题栏高，
+      **裁到上一行去**（第一次就裁到了「停止 / 开始扫描」）。
+
+    `span` 往左多框一点（把左边的兄弟按钮一起带进来）；
+    `extra_w` 往右多框一点（防自绘圆角被切边）。
+    """
+    w0, h0 = root.winfo_width(), root.winfo_height()
+    full = path + ".fullt.tmp.png"
+    gw, gh = grab(root.winfo_id(), full)
+    try:
+        os.remove(full)
+    except OSError:
+        pass
+    dx = max(0, (gw - w0) // 2)
+    dy = max(0, gh - h0 - dx)
+    x = dx + (widget.winfo_rootx() - root.winfo_rootx()) - margin - span
+    y = dy + (widget.winfo_rooty() - root.winfo_rooty()) - margin
+    bw = widget.winfo_width() + margin * 2 + span + extra_w
+    bh = widget.winfo_height() + margin * 2
+    return grab(root.winfo_id(), path, box=(x, y, bw, bh))
 
 
 def settle(win, n=25, pause=0.035):

@@ -24,6 +24,7 @@ pHash 描述的是「整张图长什么样」，裁掉一圈后构图变了，�
 from __future__ import annotations
 
 import math
+from operator import mul
 
 __all__ = [
     "describe", "hamming64", "window_list", "region_gray", "corr",
@@ -113,24 +114,45 @@ def dct_hash16(gray) -> int:
 
     DCT 取左上 HASH_KEEP x HASH_KEEP 低频；丢掉 DC 分量（整体亮度不该影响指纹）；
     与中位数比较出比特。
+
+    ⚠️⚠️ **这是个逐位敏感的纯 Python 热点**（v1.9 优化，主人 2026-10-07
+    报「加载 400 图片就会很慢很卡」）。cProfile 显示它独占 `describe`
+    的 **65%**：每张图 139 个区域，每个区域 128 次长度 16 的点积，
+    原来写成 `sum(a * b for a, b in zip(...))` —— 光生成器就有 **1800 万次**
+    `__next__` 调用，全在 Python 层。
+
+    改法（**结果逐位不变**，由 `probe_desc_opt.py` 的 E2/E3 逐位比对兜底）：
+      · `sum(map(mul, x, y))` 代替 `sum(a*b for a,b in zip(x,y))` ——
+        循环回到 C 层，不用建生成器、不用解包元组。
+        两者**都走 `sum()` 的浮点补偿求和**，所以第一趟比特级相同。
+      · `tmp` 改成 **v 为主序**（`tmpv[v][y]`），第二趟直接从列上取，
+        省掉 `tmp[y][v]` 的双层下标。
+      · ⚠️⚠️ **第二趟必须保留朴素的 `s += `**，不能图快也换成 `sum()`：
+        CPython 3.12 起 `sum()` 对全 float 序列会走 **Neumaier 补偿求和**，
+        累加舍入跟朴素循环**不一样**。第一版就踩了这个坑 ——
+        均匀灰图（各项互相抵消到 1e-16 量级）上 55/400 个指纹变了，
+        而真实照片上 5560 个区域恰好全都一致，光看真实图根本发现不了。
     """
     cos, norm = _COS, _NORM
     n, keep = HASH_N, HASH_KEEP
 
-    # 可分离 DCT：先按行
-    tmp = []
+    # 可分离 DCT：先按行。tmpv[v][y] = Σ_x gray[y][x] * cos[v][x]
+    tmpv = [[0.0] * n for _ in range(keep)]
     for y in range(n):
         gy = gray[y]
-        tmp.append([sum(a * b for a, b in zip(gy, cos[v])) for v in range(keep)])
+        for v in range(keep):
+            tmpv[v][y] = sum(map(mul, gy, cos[v]))
 
     vals = []
     for u in range(keep):
         nu = norm[u]
         cu = cos[u]
         for v in range(keep):
+            col = tmpv[v]
             s = 0.0
+            # ⚠️ 朴素累加，不许换成 sum()（见上面 docstring 的 Neumaier 陷阱）
             for y in range(n):
-                s += tmp[y][v] * cu[y]
+                s += col[y] * cu[y]
             vals.append(s * nu * norm[v])
 
     vals[0] = 0.0                       # 丢掉 DC
@@ -207,24 +229,41 @@ def region_gray(I, stride, gw, gh, rect, n=None):
     """从积分图取一个矩形，面积平均成 n x n 灰度（返回扁平 list + n）。
 
     坐标夹到网格范围内；空矩形返回 (None, n)。
+
+    ⚠️ v1.9 优化（占 `describe` 的 24%，cProfile 里 213 万次 `_rect_sum`）：
+      · `_rect_sum` **内联**进循环 —— 那是个 4 项加法，函数调用开销比算术本身还大；
+      · `xa/xb` 只跟 `(n, x0, x1)` 有关，**提到 ty 循环外面**算一次
+        （原来每个 ty 都重算一遍 n 个 tx 的边界）；
+      · `yb = max(ya+1, ...)` 的夹取也提前算。
+    数值逐位不变，由 `probe_desc_opt.py` 的 E1/E3 逐元素比对兜底。
     """
     n = HASH_N if n is None else n
-    x0, y0, x1, y1 = rect[0], rect[1], rect[2], rect[3]
-    x0 = max(0, min(int(x0), gw - 1))
-    y0 = max(0, min(int(y0), gh - 1))
-    x1 = max(x0 + 1, min(int(x1), gw))
-    y1 = max(y0 + 1, min(int(y1), gh))
+    x0 = max(0, min(int(rect[0]), gw - 1))
+    y0 = max(0, min(int(rect[1]), gh - 1))
+    x1 = max(x0 + 1, min(int(rect[2]), gw))
+    y1 = max(y0 + 1, min(int(rect[3]), gh))
+
+    dx = x1 - x0
+    dy = y1 - y0
+    xa_l = [x0 + dx * t // n for t in range(n)]
+    xb_l = [max(xa_l[t] + 1, x0 + dx * (t + 1) // n) for t in range(n)]
+    cnt_l = [xb_l[t] - xa_l[t] for t in range(n)]
 
     out = [0] * (n * n)
     for ty in range(n):
-        ya = y0 + (y1 - y0) * ty // n
-        yb = max(ya + 1, y0 + (y1 - y0) * (ty + 1) // n)
+        ya = y0 + dy * ty // n
+        yb = max(ya + 1, y0 + dy * (ty + 1) // n)
+        bb = yb * stride
+        ba = ya * stride
+        band_h = yb - ya
+        o = ty * n
         for tx in range(n):
-            xa = x0 + (x1 - x0) * tx // n
-            xb = max(xa + 1, x0 + (x1 - x0) * (tx + 1) // n)
-            s = _rect_sum(I, stride, xa, ya, xb, yb)
-            cnt = (xb - xa) * (yb - ya)
-            out[ty * n + tx] = s // cnt if cnt else 0
+            xa = xa_l[tx]
+            xb = xb_l[tx]
+            # == _rect_sum(I, stride, xa, ya, xb, yb)，内联
+            s = I[bb + xb] - I[ba + xb] - I[bb + xa] + I[ba + xa]
+            cnt = cnt_l[tx] * band_h
+            out[o + tx] = s // cnt if cnt else 0
     return out, n
 
 

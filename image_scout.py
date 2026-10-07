@@ -31,6 +31,7 @@ from __future__ import annotations
 import math
 import os
 import queue
+import shutil
 import sys
 import threading
 import time
@@ -647,6 +648,13 @@ class App(tk.Tk):
         self.gidx = -1
         self._group_mem = 0       # 上次看的是第几组（切到「全部图片」再切回来要用）
         self.cur_member = None
+        # ⚠️ 组内 **3 张及以上**时，用户在成员列表里自己点选的那两张
+        #    （v1.10，主人 2026-10-07：「本组成员里面如果 3 个及以上
+        #     最好是自定义组员图片来对比」）。
+        #    最多两项：`[A, B]`；空列表 = 还没自定义，沿用 `_auto_pair`。
+        self.pick_pair = []
+        # 撤销栈：每次「移入隔离夹」压一条**完整现场快照**（见 `_push_undo`）。
+        self.undo_stack = []
         self.path_a = None
         self.path_b = None
         self.pair = None
@@ -657,6 +665,9 @@ class App(tk.Tk):
         self.t_start = 0.0
         self.mode = "pair"
         self.view = "groups"      # groups / all
+        # 排列方向（v1.9）。False = 默认（分组按张数降序、质量差的排前面），
+        # True = 整体倒序。见 `toggle_sort`。
+        self.sort_rev = False
         # 缩放是**每一侧各一份**：滚轮只作用于鼠标底下那一张。
         # 早先是一个全局值，一滚两边一起变大，想「A 放大看细节、B 保持全貌」就做不到。
         self.zoom = [1.0, 1.0]
@@ -677,6 +688,12 @@ class App(tk.Tk):
         #   厚还是薄（滚轮和拖动传的都是 `precise=0.75`，需求相反，
         #   详见 `_render_tile` 里 `_pad_scale` 那段注释）。
         self._pan_redraw_active = False
+        # ⚠️ **联动对齐的「待办」**：侧 -> ((nx, ny), zoom)。
+        # 另一侧画布还没布局好时 `_link_apply` 只存不套，
+        # 等它真出图（`_render_side` 建好 `_view` 之后）再取用。
+        # 不存的话，「只在第一格错」的偏差会永久留在画面上
+        # （见 `_link_apply` 里 v1.8 那段实测记录）。
+        self._link_pend = {}
         self._prewarm_q = []
         self._prewarm_busy = False
         self._prewarm_pause = 0.0
@@ -687,6 +704,9 @@ class App(tk.Tk):
         self._base_want = {}          # 想要但还没动手的 (路径, 档位) -> 参数
         self._q = queue.Queue()
         self._later_ids = {}
+        # 进度回调的节流状态（详见 `_progress` 的注释）
+        self._prog_pend = None    # 还没落地的 (frac, text)
+        self._prog_t = 0.0        # 上次落地的时间
         self._keep = []           # 主预览图的引用
         self._view = {}           # 侧 -> {画布, 图元, 出图时的位置/平移量, 显示尺寸}
         self._fit_pend = {}       # 侧 -> 正在后台编码的那一帧（防重算 / 防张冠李戴）
@@ -696,6 +716,13 @@ class App(tk.Tk):
         self.preset_key = scan.DEFAULT_PRESET
         self.recursive_var = tk.BooleanVar(value=True)
         self.crop_only = tk.BooleanVar(value=False)
+        # ⚠️⚠️ **双图联动**：默认**关**。
+        #
+        # 为什么默认关：并排对比时两张图**内容不同、构图不同**，锁定缩放后
+        # 一张图看到的脸在另一张上根本不在同一处，联动会让人找不着北。
+        # 所以这是**给「要看同一处细节」准备的**（比如查同源图有没有被裁改），
+        # 由用户主动打开。
+        self.link_view = tk.BooleanVar(value=False)
 
         self._fonts()
         self._style()
@@ -713,6 +740,7 @@ class App(tk.Tk):
         self.f_txt = f(10)
         self.f_small = f(9)
         self.f_tiny = f(8)
+        self.f_key = f(9, True)      # 说明弹窗里的「键名」列
 
     def _style(self):
         st = ttk.Style(self)
@@ -761,6 +789,11 @@ class App(tk.Tk):
         这种误删要弹确认框都救不回来（用户会一路按 Yes）。
         """
         def on_key(ev):
+            # ⚠️⚠️ **说明弹窗开着时一律让路**（v1.11）。弹窗只是「挡在前面」，
+            #    并不会阻止 `bind_all` 的键盘事件 —— 用户在说明里按
+            #    A / D / Delete，**后台的图会照样被移除**，而他完全看不见。
+            if getattr(self, "_help_win", None) is not None:
+                return
             # 焦点在输入类控件里 -> 只放行编辑键，其余一律不抢
             w = self.focus_get()
             if isinstance(w, (tk.Entry, tk.Text)) or \
@@ -768,6 +801,10 @@ class App(tk.Tk):
                 return
             k = (ev.keysym or "").lower()
             ch = (ev.char or "").lower()
+            # Ctrl+Z = 撤销（v1.11）。⚠️ state 的 0x4 位就是 Ctrl。
+            if k == "z" and ((ev.state or 0) & 0x4):
+                self.undo()
+                return "break"
             step = None
             if k in ("up", "w"):
                 step = -1
@@ -805,6 +842,129 @@ class App(tk.Tk):
         #    键盘输入，测试环境没有焦点链），第一版就靠「派发不到就直调
         #    兜底」蒙过去 —— 那是假测：断言过了，但派发那条路根本没验证。
         self._on_key = on_key
+
+    def show_help(self):
+        """「说明 / 快捷键」弹窗（v1.11，主人：「右上可以添加一个说明按钮」）。
+
+        ⚠️⚠️ 打开时必须让 `_bind_keys` 的 `on_key` **让路**（见那里的
+        `_help_win` 判断）：不然弹窗挡在前面，用户在说明里按 A / D /
+        Delete，**后台的图照样被删掉** —— 而且他完全看不见发生了什么。
+        """
+        if getattr(self, "_help_win", None) is not None:
+            try:
+                self._help_win.lift()
+                self._help_win.focus_force()
+                return
+            except tk.TclError:
+                self._help_win = None
+
+        keys = [
+            ("↑ / W", "上一张（上一组 / 上一张图）"),
+            ("↓ / S", "下一张"),
+            ("J / K", "同上（vim 风格）"),
+            ("← / A", "移除左侧这一张"),
+            ("→ / D", "移除右侧这一张"),
+            ("Delete", "移除当前这一侧"),
+            ("Ctrl + Z", "撤销上一次移除"),
+            ("0", "缩放回到「适应窗口」"),
+            ("滚轮", "在图上滚 = 缩放"),
+            ("按住拖动", "平移画面"),
+            ("双击图片", "交给系统看图器打开"),
+            ("双击左栏", "换主图 / 打开这一张"),
+        ]
+        funcs = [
+            ("添加文件夹", "选一个目录来查重（可以加多个）"),
+            ("添加图片", "直接挑几张图丢进来"),
+            ("含子文件夹", "连子目录一起扫"),
+            ("灵敏度", "严格 / 标准 / 宽松，越严越少误报"),
+            ("相似分组", "张数多的在前；同数量比质量、再比组号"),
+            ("全部图片", "不看分组，把所有图按质量平铺"),
+            ("排列 ↓ / ↑", "一键倒序"),
+            ("本组成员", "3 张以上可点两张自己比（挂 A / B）"),
+            ("只看匹配区域", "并排时只显示两张相同的部分"),
+            ("双图联动", "缩放和平移同时作用到两侧"),
+            ("定位 A / B", "在资源管理器里选中这个文件"),
+            ("复制 A / B", "把图放进剪贴板，可以直接粘贴"),
+            ("移除 A / B", "移进「_隔离」夹，不是删除；能撤销"),
+            ("撤销", "把上一次移除的图搬回原位"),
+            ("清理完全重复", "只清哈希完全一样的，留最好的一张"),
+        ]
+
+        w = tk.Toplevel(self)
+        self._help_win = w
+        w.title("说明 / 快捷键")
+        w.configure(bg=P.PAGE)
+        w.resizable(False, False)
+        try:
+            w.transient(self)
+        except tk.TclError:
+            pass
+
+        tk.Label(w, text="图片查重 · 使用说明", bg=P.PAGE, fg=P.TEXT,
+                 font=self.f_h1, anchor="w").pack(
+                     fill="x", padx=S(16), pady=(S(14), S(3)))
+        tk.Label(w, text="这里的「移除」都是移进「_隔离」文件夹，不是真删除 ——"
+                         "随时可以撤销，或者把文件拖回原目录。",
+                 bg=P.PAGE, fg=P.TEXT_2, font=self.f_small,
+                 anchor="w").pack(fill="x", padx=S(16), pady=(0, S(10)))
+
+        body = tk.Frame(w, bg=P.PAGE)
+        body.pack(fill="both", expand=True, padx=S(16))
+        self._help_col(body, "快捷键", keys, (0, S(10)))
+        self._help_col(body, "功能", funcs, (0, 0))
+
+        foot = tk.Frame(w, bg=P.PAGE)
+        foot.pack(fill="x", padx=S(16), pady=(S(12), S(14)))
+        uikit.RoundButton(foot, "知道了", command=self._close_help,
+                          kind="primary", page=P.PAGE, size=10,
+                          padx=S(26), pady=S(8)).pack(side="right")
+
+        w.bind("<Escape>", lambda e: self._close_help())
+        w.protocol("WM_DELETE_WINDOW", self._close_help)
+        w.update_idletasks()
+        try:
+            x = self.winfo_rootx() + (self.winfo_width() - w.winfo_width()) // 2
+            y = self.winfo_rooty() + (self.winfo_height() - w.winfo_height()) // 3
+            w.geometry("+%d+%d" % (max(0, x), max(0, y)))
+        except tk.TclError:
+            pass
+        w.focus_force()
+
+    def _help_col(self, parent, title, pairs, pad):
+        """说明弹窗里的一栏（标题 + 若干「键名 -> 说明」行）。
+
+        ⚠️ 用 `grid` 而不是 pack 排「键名 / 说明」两列：中文键名
+        （「按住拖动」）和拉丁键名（「Ctrl + Z」）的**显示宽度差一倍**，
+        用 `Label(width=N)` 对齐会歪。grid 的两列各自按最宽的那条对齐。
+        """
+        card = tk.Frame(parent, bg=P.CARD)
+        card.pack(side="left", fill="both", expand=True, padx=pad)
+        card.columnconfigure(1, weight=1)
+        tk.Label(card, text=title, bg=P.CARD, fg=P.TEXT, font=self.f_h2,
+                 anchor="w").grid(row=0, column=0, columnspan=2, sticky="w",
+                                  padx=S(14), pady=(S(12), S(8)))
+        for i, (k, v) in enumerate(pairs):
+            tk.Label(card, text=k, bg=P.CARD, fg=P.PRIMARY_D,
+                     font=self.f_key, anchor="w").grid(
+                         row=i + 1, column=0, sticky="w",
+                         padx=(S(14), S(10)), pady=S(3))
+            tk.Label(card, text=v, bg=P.CARD, fg=P.TEXT_2,
+                     font=self.f_small, anchor="w", justify="left").grid(
+                         row=i + 1, column=1, sticky="w",
+                         padx=(0, S(14)), pady=S(3))
+        tk.Frame(card, bg=P.CARD, height=S(10)).grid(row=len(pairs) + 1, column=0)
+        return card
+
+    def _close_help(self):
+        # ⚠️ 用 getattr 兜底：这个方法会被 `WM_DELETE_WINDOW` / Escape 绑定调用，
+        #    也可能在「从没开过弹窗」时被直接调（探针就会这么干）——
+        #    直接 `self._help_win` 会 AttributeError 把回调炸掉。
+        w, self._help_win = getattr(self, "_help_win", None), None
+        if w is not None:
+            try:
+                w.destroy()
+            except tk.TclError:
+                pass
 
     def _key_move(self, step):
         """上下 / W S：切到上下一组（分组视图）或上下一张（全部图片视图）。
@@ -888,18 +1048,19 @@ class App(tk.Tk):
                 pass
 
     def _key_delete(self, side=0):
-        """Delete / A / D / Backspace：删掉当前这一侧的图（走既有确认框）。
+        """Delete / A / D / Backspace：删掉当前这一侧的图。
 
-        ⚠️ 复用 `delete_side`，不要另写一套 —— 它才有那个
-        「是移动不是删除、隔离位置在哪」的确认框，以及删完之后
-        的列表/统计/结论的整套重算。
+        ⚠️ 复用 `delete_side`，不要另写一套 —— 删完之后的
+        列表/统计/结论的整套重算都在它里面。
 
         ⚠️⚠️ **单图模式下按 `D`（删右侧）不能静默改成删左侧**。
         原来 `col = side if (mode == "pair" and side == 1) else 0` 一把
         把 side 吞掉 —— 单图模式下根本没有右侧，按 `D` 却在删**当前
-        正在看的那张**。用户以为「删右边」，实际删的是眼前这张：这是
-        误删，而误删只有确认框挡着（用户赶时间会一路按 Yes）。
-        改成说清楚「现在只有一张，删的是它」。
+        正在看的那张**。用户以为「删右边」，实际删的是眼前这张。
+
+        ⚠️ v1.10 起 `delete_side` **不再弹确认框**（移入隔离夹可逆，
+        主人明确要求去掉），所以这里**更要**把「删的是哪一张」说清楚、
+        并在删除前把左右两侧区分开 —— 以前那道帘子没了。
         """
         pair = (self.mode == "pair" and bool(self.path_b))
         if side == 1 and not pair:
@@ -971,13 +1132,30 @@ class App(tk.Tk):
         self.stat = tk.Label(line2, text="就绪", bg=P.CARD, fg=P.TEXT_2,
                              font=self.f_small, anchor="w")
         self.stat.pack(side="left")
-        self.clip_hint = tk.Label(line2, text="", bg=P.CARD, fg=P.TEXT_3,
-                                  font=self.f_tiny, anchor="e")
-        self.clip_hint.pack(side="right", padx=(S(8), S(8)))
+        # ⚠️ `side="right"` 是**先 pack 的在最右**，所以下面的 pack 顺序
+        #    就是「从右到左」的排布：说明 -> 清理 -> 撤销 -> 剪贴板提示。
+        #    主人 2026-10-07：「右上可以添加一个说明按钮」-> 说明放最右上。
+        self.btn_help = uikit.RoundButton(
+            line2, "说明 / 快捷键", command=self.show_help,
+            kind="ghost", page=P.CARD, size=10, padx=S(13), pady=S(6))
+        self.btn_help.pack(side="right", padx=(0, S(6)))
+
         self.btn_dedup = uikit.RoundButton(
             line2, "清理完全重复", command=self.clean_exact_dups,
             kind="soft", page=P.CARD, size=10, padx=S(15), pady=S(6))
-        self.btn_dedup.pack(side="right", padx=(0, S(4)))
+        self.btn_dedup.pack(side="right", padx=(0, S(6)))
+
+        # ⚠️ 「撤销」紧挨着删除类操作放（v1.11）。它不是装饰 ——
+        #    `delete_side` 已经不弹确认框了，撤销就是那道兜底。
+        self.btn_undo = uikit.RoundButton(
+            line2, "撤销", command=self.undo,
+            kind="soft", page=P.CARD, size=10, padx=S(15), pady=S(6))
+        self.btn_undo.pack(side="right", padx=(0, S(6)))
+        self.btn_undo.configure_state("disabled")   # 栈空时灰着
+
+        self.clip_hint = tk.Label(line2, text="", bg=P.CARD, fg=P.TEXT_3,
+                                  font=self.f_tiny, anchor="e")
+        self.clip_hint.pack(side="right", padx=(S(8), S(8)))
         self._clipboard_hint()
 
     def _sep(self, row):
@@ -1004,6 +1182,15 @@ class App(tk.Tk):
             head, "全部图片", command=lambda: self.set_view("all"),
             kind="ghost", page=P.CARD, size=9, padx=S(13), pady=S(6))
         self.btn_view_all.pack(side="left")
+        # 排列方向（v1.9）。主人 2026-10-07：
+        # 「图片分组可以根据每组的图片数量来排序，数量多的放上面，
+        #   每组和全部图片按照图片质量来排序，同时支持倒序。」
+        # 一个按钮管全部：分组顺序 + 「全部图片」的质量顺序 + 组内成员顺序。
+        self.btn_sort = uikit.RoundButton(
+            head, "排列 ↓", command=self.toggle_sort,
+            kind="ghost", page=P.CARD, size=9, padx=S(12), pady=S(6))
+        self.btn_sort.pack(side="right", padx=(0, S(4)))
+        self._sync_sort_btn()
 
         # 上面这块（分组）给大：让它吃掉左栏的剩余高度
         self.glist = uikit.NiceList(
@@ -1024,7 +1211,12 @@ class App(tk.Tk):
 
         # 下面这块（成员）刻意小一些
         self.mlist = uikit.NiceList(
-            L, on_pick=self._on_pick_member, on_activate=self._on_activate_member,
+            L, on_pick=self._on_pick_member,
+            # ⚠️ 「再点一次」也要通知（v1.10）：组内 >=3 张时靠它取消自己
+            #    点选的那张。只有成员表需要这个通道 —— 分组表点同一行
+            #    重复触发没有意义。
+            on_repick=self._on_pick_member,
+            on_activate=self._on_activate_member,
             row_h=50, thumb=36, page=P.CARD, size=9, radius=11,
             height=S(186),
             empty_text="选中上面的一组，这里会列出它的成员。")
@@ -1156,6 +1348,18 @@ class App(tk.Tk):
                                           kind="ghost", page=P.CARD, size=9,
                                           pady=S(4), padx=S(10))
         self.btn_crop.pack(side="left", padx=(0, S(4)))
+        # ⚠️⚠️ **双图联动开关**（v1.8，主人要的功能）。
+        #
+        # 放「只看匹配区域」旁边：两个都是「看图时怎么显示」类的开关，
+        # 挤在一起比塞到别处好找。
+        #
+        # ⚠️ **只在并排对比时才有意义**，单图模式下按了没反应 ——
+        # 所以 `toggle_link` 里会提示一句，而不是默默不动。
+        self.btn_link = uikit.RoundButton(top, "双图联动",
+                                          command=self.toggle_link,
+                                          kind="ghost", page=P.CARD, size=9,
+                                          pady=S(4), padx=S(10))
+        self.btn_link.pack(side="left", padx=(0, S(4)))
 
     # ------------------------------------------------------------------
     # 剪贴板
@@ -1323,6 +1527,7 @@ class App(tk.Tk):
 
     def stop_scan(self):
         self.stop_flag = True
+        self._prog_pend = None
         self.stat.configure(text="正在停止…")
 
     def _ui(self, fn, *a):
@@ -1375,11 +1580,66 @@ class App(tk.Tk):
         self._later_ids[key] = self.after(ms, fn)
 
     def _phase(self, text):
+        """切换阶段文字（「计算指纹…」「比较配对…」）。
+
+        ⚠️ 要把还挂着的进度更新**丢掉**：阶段文字比进度新，
+        留着的话下一次 `_progress` 落地会把阶段文字顶掉。
+        """
+        self._prog_pend = None
         self.stat.configure(text=text)
 
+    # 进度条 / 状态文字的**最短刷新间隔**（秒）。
+    # 实测 400 张图只有 400 多个进度事件，400Hz 的刷新率用户根本看不见，
+    # 但每一次都要主线程去抢一次 GIL —— 见 `_progress` 的长注释。
+    PROG_MIN_DT = 0.2
+
+    # 组内**几张以上**才让用户自己点选对比的两张（v1.10）。
+    #
+    # ⚠️ 为什么是 3：只有两张时「比这两张」是**唯一解**，`_auto_pair`
+    #    直接摆好就行，让用户再点两下纯属多事；三张以上才有
+    #    「到底比哪两张」的选择空间。主人原话：「本组成员里面如果
+    #    3 个及以上最好是自定义组员图片来对比」。
+    PICK_MIN = 3
+
     def _progress(self, frac, text):
-        self.pb["value"] = max(0.0, min(1.0, frac)) * 100
-        self.stat.configure(text=text)
+        """带节流的进度更新。
+
+        ⚠️⚠️⚠️ **这里慢的不是控件，是「等 GIL」**（v1.9 实测，主人
+        2026-10-07 报「加载 400 图片就会很慢很卡」）。
+
+        证据（`probe_prog.py` + `_bench_gil` 对照）：
+          · 同样的 300 次 `pb["value"]=` + `stat.configure()`：
+            **没有后台线程**时合计 **33.8ms**（每次 0.1ms）；
+            **4 个扫描线程在跑**时合计 **133 秒**。
+          · 单看 `_progress` 的分位数：p50 = 0.12ms（拿得到 GIL 时几乎免费），
+            p90 = 30ms、max = 79ms —— **中位极小、尾部极大**，
+            典型的「不是这段代码慢，是它跑之前先排队等锁」。
+          · 慢调用**散布全程**（序号 7,8,11,13,14,18...），不是冷启动；
+            状态文字长度 448 次里只变了 5 次，所以也不是「宽度变触发 relayout」。
+
+        根因：扫描的 4 个工作线程跑的是**纯 Python** 的 `crops.describe`
+        （见那边的注释），全程握着 GIL，主线程每次想动一下都要等它让出来。
+        400 张图 438 次回调 -> 主线程被占 **5090ms**（占全程 28%），
+        最长一次冻了 **1425ms** —— 用户看到的就是「很卡」。
+
+        节流为什么有效：主线程抢 GIL 的次数从 438 次降到十余次，
+        等待总时长按比例下降；而「进度条走得顺不顺」肉眼根本无法分辨
+        0.2 秒的粒度（原来平均 41ms 刷一次，比这还密）。
+        """
+        now = time.monotonic()
+        self._prog_pend = (frac, text)
+        if now - self._prog_t >= self.PROG_MIN_DT:
+            self._prog_flush()
+
+    def _prog_flush(self):
+        """把挂着的进度落地（节流窗口到了 / 收尾时强制调用）。"""
+        p = self._prog_pend
+        if p is None:
+            return
+        self._prog_pend = None
+        self._prog_t = time.monotonic()
+        self.pb["value"] = max(0.0, min(1.0, p[0])) * 100
+        self.stat.configure(text=p[1])
 
     def _fail(self, msg):
         self.busy = False
@@ -1389,6 +1649,8 @@ class App(tk.Tk):
 
     def _done(self, descs, links, built, stats, key):
         self.busy = False
+        # 收尾时把挂着的进度丢掉：下面会自己把进度条钉到 100 / 状态改成汇总
+        self._prog_pend = None
         self.btn_scan.configure_state("normal")
         self.btn_stop.configure_state("disabled")
         if descs is None:
@@ -1406,6 +1668,20 @@ class App(tk.Tk):
             % (len(descs), len(self.groups_raw), len(self.weak),
                dt, stats.get("cached", 0), stats.get("decoded", 0),
                stats.get("failed", 0)))
+        # ⚠️⚠️ **重活推到下一轮事件循环**（v1.9）。
+        #
+        # 下面 `_finish_view` 里「填列表 + 选中第一组」会现场把第一对预览
+        # 解出来 + 编码 + 建 Tk 图，**冷缓存实测 1221ms**（其中
+        # `compare_pair` 335ms + `render_all` 357ms + 其余在 `set_pair`）。
+        # 原来这段是**跟 `pb["value"]=100` 同一个回调**跑的，于是
+        # 「扫描完成」这件事从头到尾没被画出来过 —— 用户看到的就是
+        # 「进度条卡在 99% 一秒多，然后突然 100%」，像程序卡死。
+        # 拆开之后：进度条 / 汇总文字立刻可见，重活等下一次事件循环。
+        # （总耗时不变，但「有反馈」和「没反馈」的手感完全是两回事。）
+        self.after(1, self._finish_view)
+
+    def _finish_view(self):
+        """扫描收尾：把左栏列表填上、选中第一组、开始预热。"""
         if self.view == "all":
             self._fill_all_list()
         else:
@@ -1463,9 +1739,80 @@ class App(tk.Tk):
     # ------------------------------------------------------------------
     # 列表
     # ------------------------------------------------------------------
+    def _group_sort_key(self, gi):
+        """分组排序键（**升序**用它）：张数多的在前，同张数按**组号**。
+
+        主人 2026-10-07：「图片分组可以根据每组的图片数量来排序，
+        数量多的放上面」、「由于是按照数量排序的，但是分组的却不是
+        按照顺序」-> 张数取负（升序即降序），**并列时按组号 `gi` 升序**。
+
+        ⚠️⚠️ 这里**只留两档，不要再插「代表图质量」那一档**（v1.11 修正）。
+        原来它是 `(-张数, 质量档, 文件名)`，第三档是文件名 —— 那固然乱。
+        但把第三档换成组号**并没有解决问题**：质量档还夹在中间，
+        并列的组仍然不按编号排。真实数据实测（18 张样本、三组各 6 张）：
+
+            视图[0] 6 张 质量=poor rank=0 -> 第 1 组
+            视图[1] 6 张 质量=good rank=3 -> 第 3 组
+            视图[2] 6 张 质量=poor rank=0 -> 第 2 组
+            屏幕上是「第 1 / 3 / 2 组」—— 主人一眼就说这是乱序，
+            而且**他没有任何办法从界面上看出这个顺序是按什么排的**。
+
+        ⚠️ 为什么不改成「按显示顺序重新编号」：那个编号是要**给人报的**
+        （`clean_exact_dups` 的提示里就是「报第几组就能定位」），
+        必须**稳定** —— 切一次排列顺序就全变号的编号没法交流。
+        所以正确做法是反过来：让**顺序服从编号**。
+        """
+        g = self.groups[gi]
+        return (-len(g["members"]), gi)
+
+    def _sorted_group_idx(self):
+        """分组在列表里的显示顺序（返回的仍是 `self.groups` 的下标）。"""
+        idx = sorted(range(len(self.groups)), key=self._group_sort_key)
+        if self.sort_rev:
+            idx.reverse()
+        return idx
+
+    def _quality_key(self, p):
+        """「全部图片」/ 组内成员的排序键：质量档位 + 文件名。
+
+        ⚠️ 默认是**质量差的排前面**（`QUALITY_RANK` 越小越差）——
+        这是原来就定的口径（用户要「质量差的强调出来」）。
+        「排列」按钮把这个顺序整体翻过来。
+        """
+        return (QUALITY_RANK.get(META.quality(p)[0], 2),
+                os.path.basename(p).lower())
+
+    def toggle_sort(self):
+        """切换默认排列 / 倒序。
+
+        ⚠️ 重填之后要**保住当前选中的东西**：分组视图保住组号，
+        「全部图片」保住当前看的那张。不然一按排列，右边预览就跳回第一张。
+        """
+        self.sort_rev = not self.sort_rev
+        self._sync_sort_btn()
+        if self.view == "groups":
+            keep = self.gidx if self.gidx >= 0 else self._group_mem
+            self._fill_group_list(select=keep)
+        else:
+            self._fill_all_list(keep=self.path_a)
+
+    def _sync_sort_btn(self):
+        self.btn_sort.set_text("排列 ↓" if not self.sort_rev else "排列 ↑")
+
     def _fill_group_list(self, select=0):
+        """填分组列表。
+
+        ⚠️ 行序由 `_sorted_group_idx()` 决定（张数降序，可倒序），
+        但 `item["tag"]` 仍然是**组号 gi**（`self.groups` 的下标）——
+        选中/切组全靠它，不能换成行号，否则一按排列就切到别的组去了。
+        所以要选的那一组得**从组号反查行号**再 `select`。
+        """
         items = []
-        for gi, g in enumerate(self.groups):
+        order = self._sorted_group_idx()
+        gi2row = {}
+        for row, gi in enumerate(order):
+            gi2row[gi] = row
+            g = self.groups[gi]
             g["index"] = gi
             rep = self._representative(g)
             if g.get("pseudo"):
@@ -1495,9 +1842,9 @@ class App(tk.Tk):
         if items:
             # 要选的那一组可能因为删除而消失了 → 退回第一组，
             # 免得「列表里有东西、右边却没人被选中」卡在空状态
-            if not (0 <= select < len(items)):
-                select = 0
-            self.glist.select(select)
+            if select not in gi2row:
+                select = order[0]
+            self.glist.select(gi2row[select])
         else:
             self.group = None
             self.gidx = -1
@@ -1517,6 +1864,14 @@ class App(tk.Tk):
         排序刻意把**质量差的排前面**（用户要「质量差的强调出来」），
         同级按文件名。质量差的还会带一个 `quality_of` 给的低质徽章 + 琥珀色标题。
 
+        ⚠️⚠️ **小预览是懒加载的**（v1.9，主人 2026-10-07 报「加载 400 图片
+        很慢很卡」）。原来这里对 400 项**每项都同步 `thumb.get(...)`** ——
+        实测 **1483ms**，全糊在扫描结束那一刻的主线程上（`_done` 因此整块
+        占了 1019~1484ms，tick 间隔 max 1134ms，肉眼就是「卡死一下」）。
+        改成给 `photo_fn`（见 `uikit.NiceList._draw_row`）：列表**画到哪一行
+        才取哪一行的缩略图**，而虚拟化让一屏只有 ~9 行 -> 400 项也只做 9 张。
+        取回来的图会写回 item，重画不重复取。
+
         ⚠️ 本函数**必须顺手把「看哪一张」定下来**（挑一行并 `notify=True`）：
         右边预览区和信息卡是跟着「列表选中的那一项」走的。只填列表不选行，
         切过来右边就是**空的**、点哪一行都像没反应 —— 用户报过这个。
@@ -1527,11 +1882,8 @@ class App(tk.Tk):
         if not files:
             files = list(self.descs)
 
-        def key(p):
-            q = META.quality(p)[0]
-            return (QUALITY_RANK.get(q, 2), os.path.basename(p).lower())
-
-        files.sort(key=key)
+        # 质量排序：默认「差的在前」，可倒序 —— 见 `_quality_key`
+        files.sort(key=self._quality_key, reverse=self.sort_rev)
         items = []
         for p in files:
             m = META.of(p)
@@ -1544,7 +1896,10 @@ class App(tk.Tk):
                 "tone": "poor" if q[0] == "poor" else "normal",
                 "badge": poor_badge(q),
                 "badge_tone": "poor",
-                "photo": self.thumb.get(p, S(40), S(9), P.CARD),
+                # 懒加载：`photo` 先留空，画到这一行时 `photo_fn` 才去解码
+                "photo": None,
+                "photo_fn": (lambda pp=p: self.thumb.get(
+                    pp, S(40), S(9), P.CARD)),
                 "tag": p})
         self.glist.set_items(items)
         if not items:
@@ -1580,8 +1935,14 @@ class App(tk.Tk):
                 self.lbl_members.configure(text="本组成员")
             return
         rep = self._representative(g)
+        # ⚠️ 切组 / 重新扫描 / 删图之后，`pick_pair` 里可能混着**不属于
+        #    当前组**的路径。在这里统一剔除，比在每一处 reset
+        #    （`cur_member = None` 那 5 个地方）都记着清一遍靠谱 ——
+        #    漏一处就是「换了组，对比区还在比上一组的图」。
+        order = self._member_order()
+        self.pick_pair = [p for p in self.pick_pair if p in order]
         items = []
-        for p in self._member_order():
+        for p in order:
             score, kind = self._score_to_rep(g, rep, p)
             m = META.of(p)
             wh = m["wh"]
@@ -1594,13 +1955,21 @@ class App(tk.Tk):
                 tone = "strong"
             else:
                 tone = "loose"
+            # ⚠️ 自己点选的那两张挂 `A` / `B` 徽章（v1.10）。行里只有一个
+            #    徽章位置，所以这里**让质量徽章先让位** —— 正在挑对比图
+            #    的时候，用户最需要知道的是「我选了哪两张」。
+            mark = ""
+            if p in self.pick_pair:
+                mark = "A" if self.pick_pair[0] == p else "B"
             items.append({"title": short_name(m["name"], 28), "sub": sub,
-                          "tone": tone, "tag": p,
-                          "badge": poor_badge(q),
+                          "tone": "match" if mark else tone, "tag": p,
+                          "badge": mark or poor_badge(q),
                           "badge_tone": "poor",
                           "photo": self.thumb.get(p, S(36), S(9), P.CARD)})
         self.mlist.set_items(items)
-        self.lbl_members.configure(text="本组成员 · %d" % len(items))
+        hint = "（点两张自己比）" if len(items) >= self.PICK_MIN else ""
+        self.lbl_members.configure(
+            text="本组成员 · %d%s" % (len(items), hint))
         idx = 0
         if self.cur_member:
             for i, it in enumerate(items):
@@ -1688,6 +2057,13 @@ class App(tk.Tk):
             return
         order = self._member_order()
         self.cur_member = path
+        # ⚠️⚠️ 组内 **3 张及以上**：单击改成「自己点选两张来比」（v1.10，
+        #    主人 2026-10-07：「本组成员里面如果 3 个及以上最好是自定义
+        #    组员图片来对比」）。两张时保持原来的自动语义 —— 那种情况
+        #    没有可选的余地，让用户点两下纯属多事。
+        if len(order) >= self.PICK_MIN:
+            self._pick_pair_click(path, order)
+            return
         if order and path == order[0] and len(order) > 1:
             # 点的是代表图本身 —— 那就跟第二像的比，别自己跟自己比
             a, b = order[0], order[1]
@@ -1697,6 +2073,37 @@ class App(tk.Tk):
         else:
             a = b = path
         self.set_pair(a, b)
+
+    def _pick_pair_click(self, path, order):
+        """组内 >=3 张时：点一下选进来，选满两张立刻并排；再点一下取消。
+
+        ⚠️ 为什么不做「点一张就换掉 A」：那样用户点第二张时**第一张被
+        无声顶掉**，他只看到画面变了、不知道刚才选的那张去哪了。
+        改成「累积到两张」+ 行上挂 `A` / `B` 徽章，每一步都看得见。
+
+        ⚠️ 超过两张用**滑动窗口**（挤掉最早那张），不是「清空重来」：
+        连着点第三、四张时，用户想的是「我在比最近这两张」，
+        清空重来会让画面先闪一下、还得多点一次。
+
+        ⚠️ 全部取消（空列表）就交回 `_auto_pair()` —— 「我不管了，
+        你自己挑」这条路必须留着，不然用户想回到默认状态只能切组。
+        """
+        pp = self.pick_pair
+        if path in pp:
+            pp.remove(path)                  # 再点一下 = 取消这一张
+        else:
+            pp.append(path)
+            del pp[:-2]                      # 只留最近两张
+        if not pp:
+            self._auto_pair()
+        elif len(pp) == 1:
+            # 只选了一张：拉代表图陪它；选的本身就是代表图就换第二像的
+            rep = order[0]
+            self.set_pair(pp[0], order[1] if (pp[0] == rep and len(order) > 1)
+                          else rep)
+        else:
+            self.set_pair(pp[0], pp[1])
+        self._fill_member_list()             # 刷新 A / B 徽章
 
     def _on_activate_member(self, item, idx):
         """双击成员：分组视图里是「把它设为主图」，全部图片视图里是「打开它」。
@@ -1750,20 +2157,34 @@ class App(tk.Tk):
         return best, kind
 
     def _member_order(self):
-        """[代表图, 其余按与代表图的相似度降序]"""
+        """[代表图, 其余按**质量**排（可倒序）]。
+
+        ⚠️ 代表图**永远排第一**：它是这一组的参照物，`_auto_pair` /
+        `mlist.select(0)` / `_on_pick_member` 全都把 `order[0]` 当基准。
+        主人 2026-10-07：「每组……按照图片质量来排序」—— 指的是
+        **代表图之后的成员**按质量排，不是把代表图也一起排掉。
+        """
         g = self.group
         if not g:
             return []
         rep = self._representative(g)
         rest = [p for p in g["members"] if p != rep]
-        rest.sort(key=lambda p: -self._score_to_rep(g, rep, p)[0])
+        rest.sort(key=self._quality_key, reverse=self.sort_rev)
         return [rep] + rest
 
     # ------------------------------------------------------------------
     # 对比
     # ------------------------------------------------------------------
     def _auto_pair(self):
-        """选中一组后自动决定比哪两张 —— 不用用户再点按钮。"""
+        """选中一组后自动决定比哪两张 —— 不用用户再点按钮。
+
+        ⚠️ 但**用户已经自己点选了两张**时以他的为准（v1.10）。切排列
+        顺序、重建列表、`_fill_group_list` 都会走到这里，不能把他的
+        选择悄悄冲掉 —— 否则「点好两张 -> 切一下排列 -> 白点了」。
+        """
+        if len(self.pick_pair) == 2:
+            self.set_pair(self.pick_pair[0], self.pick_pair[1])
+            return
         order = self._member_order()
         if not order:
             self.set_pair(None, None)
@@ -1780,6 +2201,7 @@ class App(tk.Tk):
         self.path_a, self.path_b = a, b
         self.mode = "pair" if (a and b) else "single"
         self._apply_grid()
+        self._sync_link_ui()      # 单图下把「双图联动」按钮藏掉(v1.8)
         descs = self.descs
         self.pair = None
         self.rect_a = self.rect_b = None
@@ -1870,17 +2292,42 @@ class App(tk.Tk):
         # ⚠️⚠️ **两处都是除以 zoom**（`(mx-ox)/cur` 和 `disp_w*z/cur`）。
         #    我第一版两处都写成乘法，连滚 6 格把平移推到 129 万像素 ——
         #    详见方法体里那段记录。
+        # ⚠️⚠️⚠️ **双图联动：先改本侧，再取归一化位置**（v1.8 修「缩放不同步」）。
+        #
+        # 顺序是**硬要求**，两步都不能挪：
+        #   ① `_zoom_anchor` + 改 `zoom[col]` + 改 `pan[col]`  —— 先做完
+        #   ② **然后**才取 norm，并按**新 zoom** 传给 `_link_apply`
+        #
+        # ⚠️ 我第一版把 `_lnorm = self._link_norm(col)` 写在最前面（在改动之前），
+        #   那取到的是**缩放前**的位置 —— 而缩放恰恰会把它挪走
+        #   （`_zoom_anchor` 按「鼠标底下那点不动」算，缩放后注视点确实变了）。
+        #   实测同尺寸两张图，每一格偏差 x≈0.077 / y≈0.035，**方向和数值都一样**，
+        #   而「拖一下」偏差立刻变 0.0000 —— 因为拖动时 zoom 不变。
+        _linked = self._link_target(col) is not None
         keep = self._zoom_anchor(col, ev.x, ev.y, cur, z)
         self.zoom[col] = z
         if keep is not None:
             self.pan[col] = [keep[0], keep[1]]
+        # 另一侧：倍率是**绝对值**，直接同步；位置按归一化换算
+        #（这样两张图构图不同也能对上同一处）。
+        if _linked:
+            self.zoom[1 - col] = z
+            # ⚠️⚠️ `frm=cur`不能省（见 `_link_disp`）：`_view["disp"]` 是
+            # **旧 zoom（cur）** 下记下的，而 `self.zoom[1-col]` 此刻
+            # 已经是 z了 —— 不显式给基准就会算出 `z/z = 1`，**压根不换算**。
+            _lnorm = self._link_norm(col, z, cur)
+            self._link_apply(col, _lnorm, z, cur)
         self._prewarm_yield()         # 正在缩放：预热别来抢 GIL
+        # ⚠️⚠️ **联动时两侧都要重画**（v1.8）。
+        # 只画 `only=col` 的话，另一侧的 zoom/pan 变了却没换图元 ——
+        # 画面还停在旧倍率上，看起来就是「联动只动了一半」。
+        # 代价实测：另一侧多半是缓存命中（几毫秒），比联动不同步划算。
         # 先用缓存里已有的图立刻响应（绝不同步重解大图 —— 那是「缩放好卡」
         # 的根源），再防抖 170ms 按新 zoom 精确重解一帧。连滚 N 格只解一次。
         # ⚠️ 系数 0.75 不是 0.5：粗档是 2 倍欠采样，主人反馈「放大还有马赛克」。
         #    0.75 欠采样 1.33 倍（看不出糊），而正在看的那两张在预热里已经
         #    备满了档，这里几乎都是缓存命中，代价一样是几毫秒。
-        self.render_all(precise=0.75, only=col)
+        self.render_all(precise=0.75, only=None if _linked else col)
         # ⚠️⚠️ **防抖到期的那一帧，拖动中必须跳过**（v1.7 修帧间隔 185ms）。
         #
         # 埋点抓到：滚轮防抖留的 `zoomhi` 回调是 `precise=True` 精确重画
@@ -1893,11 +2340,233 @@ class App(tk.Tk):
         def _zoom_hi(c=col):
             if self._drag:
                 return
-            self.render_all(precise=True, only=c)
+            #⚠️⚠️ 联动时 `only=None`（两侧都补精确帧）。原来固定 `c`，
+            #   联动后另一侧就永远停在 0.75 那一档 —— 「联动看着糊」。
+            self.render_all(precise=True, only=None if _linked else c)
         self._later("zoomhi%d" % col, 170, _zoom_hi)
+        if _linked:
+            # 另一侧也要有自己的防抖键，否则它那份精确帧永远不会被安排
+            self._later("zoomhi%d" % (1 - col), 170, _zoom_hi)
         self._toast("%s缩放 %.0f%%（滚轮调整，按住可拖动）"
                     % ("" if self.mode != "pair" else ("左" if col == 0 else "右"),
                        z * 100))
+
+    # -- 双图联动 --------------------------------------------------------
+    #
+    # ⚠️⚠️ **联动不能直接抄 `pan` 数值**，必须按「归一化位置」换算。
+    #
+    # 原因：两幅图的**画布尺寸可能不同、图的长宽比也可能不同**
+    #（左边那张 3000x2000、右边 1328x2048），`pan` 是**画布像素**。
+    # 同一个 `pan=(120,80)` 在两幅图上指的是完全不同的位置。
+    #
+    # ✅ 正确做法：把操作表达成「我正盯着图的哪个位置、放大到几倍」——
+    #    即 `(相对中心的偏移 / 显示尺寸)` 这个**无量纲比值**，
+    #    另一侧按同样的比值反解出它自己的 `pan`。
+    #    这样「看同一处」在构图完全不同的两张图上也成立。
+    #
+    # 这是本函数唯一正确的同步依据；`zoom` 则直接同步（倍率是绝对的）。
+
+    def _link_target(self, col):
+        """联动目标侧（`1 - col`）；不联动 / 非并排 / 另一侧没图时给 `None`。"""
+        if not self.link_view.get():
+            return None
+        if self.mode != "pair":
+            return None
+        other = 1 - col
+        if other == 1 and not self.path_b:
+            return None
+        if other == 0 and not self.path_a:
+            return None
+        return other
+
+    def _link_disp(self, col, zoom=None, frm=None):
+        """该侧在 `zoom` 倍下的显示尺寸。
+
+        `zoom` = 目标倍率（None = 就是当前 zoom）。
+        `frm`  = `disp` 当前对应的倍率（None = `self.zoom[col]`）。
+
+        ⚠️⚠️⚠️ **换算的基准必须是「`disp` 被记下来时那个 zoom」，
+        不是 `self.zoom[col]`**（v1.8 修「滚轮缩放两侧不同步」时踩的坑，
+        主人 2026-10-07 报）。
+
+        症状是「直接缩放不同步，要拖一下才同步上」。手算复现（两张
+        同尺寸图、画布 748x757、`_view["disp"]` = 477x736 即 zoom 1.0、
+        滚到 1.25 倍、鼠标偏离中心）：
+
+            本侧缩放后真实注视位置 norm = **(-0.0503, 0.1239)**
+            旧代码把「缩放前」的 norm 套到另一侧 -> pan=(0,0)
+            -> 另一侧 norm = **(-0.1275, 0.0891)**，偏差 x = **0.0772**
+            （探针实测 0.0771，对得上）
+
+        两个独立的错叠在一起，**只修一个还是错**：
+
+        ① **取 norm 的时机**：缩放前取的是旧位置，而 `_zoom_anchor` 按
+           「鼠标底下那点不动」算完之后注视点**已经变了**。
+           ⇒ 必须先改 zoom/pan，再取 norm（`_on_wheel` 里现在就是这么排的）。
+
+        ② **disp 用哪一档**：`_view["disp"]` 是**上一帧渲染时**的尺寸
+           （对应旧 zoom），而 `render_all` 还没跑。所以要按
+           `disp * zoom / frm` 换算到新 zoom。
+
+        ⚠️⚠️ **② 里的 `frm` 不能用 `self.zoom[col]`**：
+        `_on_wheel` 里 `self.zoom[other] = z` 是**先于** `_link_apply`
+        执行��，所以那一刻 `self.zoom[other]` 已经是新 z 了，
+        `zoom/frm = 1` ⇒ **根本没换算**（实测 `_view["disp"]` 停在
+        旧值 597x920，而正确的新值应该是 746x1150）。
+
+        ⇒ 调用方必须**显式**给出「这批 disp 是哪个 zoom 记下的」。
+        滚轮路径传 `cur`（缩放前的 zoom），拖动路径本来就是当前 zoom。
+        """
+        v = self._view.get(col)
+        if not v:
+            return None
+        disp = v.get("disp") or (0, 0)
+        if disp[0] <= 0 or disp[1] <= 0:
+            return None
+        # ⚠️⚠️⚠️ **`frm` 默认取 `_view` 自己记的「disp 是哪一档算的」**
+        # （v1.8 修「滚轮缩放两侧不同步」时栽在这两次）。
+        #
+        # `_view["disp"]` 是**渲染那一刻的 zoom** 下的尺寸，而这个
+        # `zoom` 与 `self.zoom[col]` **可能已经不是同一个数**了：
+        #   · 滚轮联动时，`self.zoom` 先改、`render_all` 后跑
+        #     -> 中间那段窗口里两者必然不等
+        #   · 拖动时 zoom 不变，两者相等
+        #   · `_fit_ready` 回来补精确帧时两者也可能不等
+        #
+        # 我原来拿 `frm` 当**参数**从调用处传进来，两次都传错：
+        #   ① 不传 -> 用 `self.zoom[col]`（已是新 zoom）-> 多乘/少乘
+        #   ② 传 `cur`（缩放前）-> 若 `disp` 已被就地更新成新档，又多乘
+        # 实测两种都量到偏差（0.0012 / 0.0022），而且**方向相反**。
+        #
+        # ✅ 正确：**让 `_view` 自己记**（写入时带上 `dz`= 当时的 zoom），
+        #    读的时候用它当基准 —— 不靠调用方传，调用方就传不错。
+        cur = v.get("dz")
+        if cur is None or cur <= 0:
+            cur = self.zoom[col] if frm is None else frm
+        if zoom is None or abs(zoom - cur) < 1e-9:
+            return (disp[0], disp[1])
+        k = float(zoom) / cur
+        return (max(1, int(round(disp[0] * k))),
+                max(1, int(round(disp[1] * k))))
+
+    def _link_norm(self, col, zoom=None, frm=None):
+        """当前这一侧「正盯着的位置」，返回 `(nx, ny)` = 偏移/显示尺寸。
+
+        > 1 表示已经拖到图的边界外（夹持会拦住，正常不会）。
+        `None` 表示拿不到（画布还没布局好）⇒ 调用方要跳过联动。
+        """
+        v = self._view.get(col)
+        if not v:
+            return None
+        disp = self._link_disp(col, zoom, frm)
+        if not disp:
+            return None
+        cw = max(1, v["cv"].winfo_width())
+        ch = max(1, v["cv"].winfo_height())
+        m = ((cw - disp[0]) // 2, (ch - disp[1]) // 2)
+        return ((self.pan[col][0] - m[0]) / float(disp[0]),
+                (self.pan[col][1] - m[1]) / float(disp[1]))
+
+    def _link_apply(self, col, norm, zoom=None, frm=None):
+        """把 `col` 侧的归一化位置套到另一侧去（另一侧的 zoom 保持不变）。
+
+        ⚠️ `zoom`/`frm` 语义见 `_link_disp`：滚轮联动时传
+          (`新 zoom`, `旧 zoom`)，拖动时都不传。
+        """
+        other = self._link_target(col)
+        if other is None or norm is None:
+            return
+        v = self._view.get(other)
+        if not v:
+            # 另一侧还没出图：记下来，等它出图时再套
+            # （`_render_side` 开头会取，见那里的 `_link_pend`）
+            self._link_pend[other] = (tuple(norm), zoom, frm)
+            return
+        disp = self._link_disp(other, zoom, frm)
+        if not disp:
+            return
+        # ⚠️ **先把 norm 存起来**（v1.8）：画布还没布局时套不上，
+        # 而滚轮第 1 格常常正好撞上（刚 `set_pair`，尺寸还没定）。
+        # 不存的话那一格的对齐会被永久丢掉 —— 实测偏差 0.19。
+        self._link_pend[other] = (tuple(norm), zoom, frm)
+        cw = max(1, v["cv"].winfo_width())
+        ch = max(1, v["cv"].winfo_height())
+        if cw <= 1 or ch <= 1:
+            return                      # 画布还没布局 -> 等 `_render_side` 来取
+        m = ((cw - disp[0]) // 2, (ch - disp[1]) // 2)
+        self.pan[other] = [int(round(m[0] + norm[0] * disp[0])),
+                           int(round(m[1] + norm[1] * disp[1]))]
+
+    def _link_sync_pan(self, col):
+        """拖动联动：把本侧**这一步的画布像素位移**换算成归一化，套到另一侧。
+
+        ⚠️ 为什么要除以显示尺寸：拖动的物理含义是「图跟着手走」，
+        位移得按**该图自己的比例**折算，否则长边图和方图会差很远
+        （同一份 `dx=120`，3000px 宽的图上是一小步，
+        800px 宽的图上就是一大步）。
+
+        ⚠️⚠️⚠️ **`dx/dy` 必须是「这一步的增量」，不是「从拖动起点的总位移」**
+        （v1.8 修，埋点抓出来的）。
+
+        我原来在 `_pan_move` 里传的是 `px - info["px"]`，
+        而 `info["px"]` 要等**本侧补块重画后**才更新 ——
+        于是这个「增量」在几步里是 0、0、8、16… 这种阶梯，
+        而另一侧每次都在**已有位置之上再减一个累计量**：
+            步1: norm(已含+0) - 0/disp -> 不动
+            步2: norm(已含+8) - 8/disp -> 回到原位
+            步3: norm(已含+16) -16/disp -> 又回到原位
+        **两侧的 pan 看起来「跟着走」，实际每步都被拉回原处**，
+        只有本侧补块重画那几步才跳一下（实测 14 步里只动 5 次）。
+
+        ✅ 正确：**用归一化位置本身当唯一真值**。
+        本侧 `pan` 一变，`_link_norm` 立刻反映新的注视位置，
+        另一侧直接对齐过去 —— 不需要任何增量、也不会有累积误差。
+        （`dx/dy` 参数因此不再需要，留着只为调用处表达意图。）
+        """
+        if self._link_target(col) is None:
+            return
+        self._link_apply(col, self._link_norm(col))
+
+    def _link_move_item(self, col):
+        """把该侧图元挪到「当前 pan 该在的位置」（只挪，不出图）。
+
+        ✅ 公式与 `_pan_move` **完全一致**：`bx + (pan - px)`。
+
+        ⚠️⚠️⚠️ **千万不要更新 `view["px"]/["py"]`**（v1.8，埋点抓出来的，
+        我第一版正好写反了，害我debug 了三轮）。
+
+        **本侧 `_pan_move` 也不更新 `info["px"]`** —— 那不是漏了，
+        而是**故意的**，它就是这套公式成立的前提：
+            `px` 一直是「**出图时**的 pan」（渲染的基准），
+            于是 `bx + (pan_now - px)` = 「出图落点 + 之后挪了多远」
+            = **图元此刻该在的绝对位置**，天然累积、不需要每步推进。
+
+        我第一版以为「不推进基准会重复累加」，于是每步
+        `v["px"] = pan` —— 结果**每步都把图元重置回出图落点 `bx`
+        再加当步增量**，之前累积的挪动全被丢掉：
+
+            埋点实测（右侧该每步动 5.2px）
+            pan    130 -> 135 -> 141 -> 146
+            coords -85 -> -78 -> -77 -> -78   ← 在出图落点 -83 附近来回晃
+            典型症状：**pan 完全正确、画面却在原地打转**。
+
+        ⇒ 教训：**照抄本侧已有的正确写法**，别自己"优化"出一个
+          看似更合理的版本。同一件事在同一个文件里已经做对了。
+        """
+        v = self._view.get(col)
+        if not v or v.get("item") is None:
+            return
+        cv = v["cv"]
+        dx = self.pan[col][0] - (v.get("px") or 0)
+        dy = self.pan[col][1] - (v.get("py") or 0)
+        if not dx and not dy:
+            return                # 与出图时一致，落点已经对了
+        # ⚠️ `bx/by` 是「出图时的落点」，`px/py` 是「出图时的 pan」
+        #   —— 两个基准一起用，位置才是绝对正确的（同 `_pan_move`）。
+        cv.coords(v["item"], v.get("bx", v["ox"]) + dx,
+                  v.get("by", v["oy"]) + dy)
+        # ⚠️⚠️ **这里绝对不要写** `v["px"], v["py"] = self.pan[col]`！
+        #   写了就等于每步重置基准，画面会「在原地打转」（见上面）。
 
     def _zoom_anchor(self, col, mx, my, cur, z):
         """算「以鼠标底下那点为锚点」缩放后该有的平移量，返回 `(pan_x, pan_y)`。
@@ -2112,6 +2781,13 @@ class App(tk.Tk):
         cv.coords(info["item"], info.get("bx", info["ox"]) + (px - info["px"]),
                   info.get("by", info["oy"]) + (py - info["py"]))
         self.pan[col][0], self.pan[col][1] = px, py
+        # ⚠️⚠️ **双图联动：把另一侧的图元也挪到对应位置**（v1.8）。
+        #
+        # 这一步**只挪图元、绝不出图** —— 和本侧一样「一移动就重画会卡成幻灯片」。
+        # 所以另一侧的补块交给下面 `_pan_fill` 统一做（`only=None` 两侧都画）。
+        if self._link_target(col) is not None:
+            self._link_sync_pan(col)         # 对齐另一侧（见其docstring）
+            self._link_move_item(1 - col)    # 只挪图元，出图交给 _pan_fill
         # ⚠️⚠️ **真正的判据是「离露白还有多远」**，不是「盖没盖满」。
         #
         # v1.6 的 `_tile_needs_more` 判的是「bbox 盖不满画布就重画」，
@@ -2198,12 +2874,29 @@ class App(tk.Tk):
         #   没有自己的 ox/oy（我第一版直接写 `ox`，NameError）。
         _vox = info.get("ox", 0)
         _voy = info.get("oy", 0)
-        # ⚠️⚠️ **必须先把 pan 的增量算进去**（v1.7）：
-        #   网格是**渲染那帧**的 ox 算出来的，而 `info["ox"]` 是**上一帧**
-        #   的 —— 两者差一个本步的 pan 增量。漏掉这一步判据会整体偏一格
-        #   ->「提前一格补块」（实测补块从 12 涨到 41 就是这个）。
-        _vox -= (px - _prev[0])
-        _voy -= (py - _prev[1])
+        # ⚠️⚠️⚠️ **必须先把 pan 的增量算进去，而且符号是「加」**（v1.8 修）。
+        #   网格是**渲染那帧**的 ox 算出来的，而 `info["ox"]` 是**那一帧**的
+        #   —— 两者差一个本步的 pan 增量。漏掉这一步判据会整体偏一格
+        #   ->「提前一格补块」（实测补块从 12涨到 41 就是这个）。
+        #
+        # ⚠️⚠️⚠️ **符号必须是 `+=`，我原来写成了 `-=`（v1.7 遗留）**。
+        #
+        #   `ox = (cw - disp_w)//2 + pan` —— **pan 增大，ox 就增大**。
+        #   所以「本步的 ox」= 「渲染那帧的 ox + 本步 pan 增量」。
+        #
+        #   写成减号的后果（实测，不是推演）：
+        #     向左拖（pan 减小）-> `_vox` 反而变大 -> `_g` 偏大
+        #     -> 每一格都误判「跨格」-> **每步都补块**。
+        #   埋点（`_d5.py`）在「左」方向量到：
+        #     k=7  my_g=(2,5)  g0=(3,5)   XX   <- 本侧算的格子比记录的小
+        #     k=9  my_g=(2,5)  g0=(3,5)   XX
+        #   即「自己算的格」和「渲染记录的格」在反向漂移，越拖越偏。
+        #   `probe_pan2.py` 那时量到「左 43/115、上 57/115 补块过频」，
+        #   根因就在这一行 —— 不是网格量化、不是贴边退化。
+        #
+        # ⚠️ 同理纵向也是加号（`oy = (ch - disp_h)//2 + pan_y`）。
+        _vox += (px - _prev[0])
+        _voy += (py - _prev[1])
         # ⚠️⚠️ **索引也必须夹到 0，与 `_render_tile` 的 `vx0 = max(0, _gridx)`
         # 完全一致**（v1.7 修露白）。拖到图顶/图左时 `_gridx` 是负数、
         # 被 `max(0, ...)` 夹成了 0 —— 可索引还留着那个负数，于是
@@ -2214,18 +2907,37 @@ class App(tk.Tk):
         # 夹到 0 之后再乘回去，就是 `_render_tile` 里那个网格起点
         _g = (max(0, _gx), max(0, _gy))
         _g0 = info.get("grid")
-        # ⚠️⚠️ **判据只能看横向网格**（v1.7，配合「横向定长、纵向跟视口」）。
+        # ⚠️⚠️ **两维都要看网格**（v1.8，配合「两维都定长」）。
         #
-        # 横向块长恒定、起点由网格定=> 横向跨格就是缓存 key 变了，
-        # **必须补**。
-        # 纵向块长跟着视口走=> 纵向跨格时key **本来就该变**（不是失效），
-        # 可那一帧图元还是旧块的（纵向滑动的代价），所以纵向要靠 slack
-        # 判「真的快露白了就补」。我第一版把两维都用网格判，
-        # 结果「上」方向补块从 8涨到 16 —— 纵向网格一格121px、
-        # 而纵向缓冲只剩~48px，等不到那一格就先露白了。
-        _crossed = (_g0 is None) or (_g[0] != _g0[0])
-        if not _no_room and _moved and (_crossed or left < 1) and \
-                left < self._pan_redraw_px(disp[0], disp[1], cw, ch):
+        # v1.7 是「横向定长 + 纵向跟视口」，那时只有横向跨格才意味着
+        # 缓存 key 变了，纵向靠 slack 判。v1.8 把纵向也改成定长
+        # （`vy1 = vy0 + _ny`，为了缓存能命中），于是：
+        #   · **纵向跨格 = 缓存 key 变了** → 和横向一样必须补
+        #   · **纵向 slack 也变恒定** → 靠 slack 判**再也不会触发**
+        #
+        # ⚠️⚠️ 若只改成「两维跨格」，那个 `left <1` 的兜底会跟着失效 ——
+        #   slack 恒定在缓冲厚度上，永远 `>1`，于是**只有网格跨格才补**。
+        #   这本身是对的（网格步长 = 缓冲厚度，跨格前一定还没露白），
+        #   但必须**显式验一遍**，不能假设。见 `probe_stall.py` 的场景 S：
+        #   判据是「拖 200 步全程不许露白，且 p95 帧耗时 < 20ms」。
+        _crossed = (_g0 is None) or (_g[0] != _g0[0]) or (_g[1] != _g0[1])
+        # ⚠️⚠️⚠️ **「跨格」和「缓冲还厚」是两种不同的补块理由，不能用一个
+        # `and` 卡在一起**（v1.8 修，纵向定长之后才暴露）。
+        #
+        # `left < _pan_redraw_px(...)` 是 v1.7 为「纵向跟视口」加的闸门：
+        # 纵向块滑动时 slack 会一路掉到很小，靠它**提前**补，别等露白。
+        #
+        # 可 v1.8 两维都定长之后，slack 恒定在缓冲厚度上（实测 pad=66/133），
+        # **永远大于阈值** —— 于是那个 `and` 让 `left < 1` 和 `left < 阈值`
+        # 两条路全都被堵死，`_crossed` 单独决定补不补。
+        # 结果：跨格时补块时机被 `left` 意外否决（缓冲厚的时候反而不补），
+        # 或者反过来被 slack 意外放行，两种都错。
+        #
+        # ✅ 正确：**两个理由各自独立成立就补**。
+        #   · `_crossed`：缓存 key 变了（定长块，跨格 = 必须换）
+        #   · `left < 阈值`：缓冲快用完了（滑动块的老口径，留着兜底）
+        _need = _crossed or (left < self._pan_redraw_px(disp[0], disp[1], cw, ch))
+        if not _no_room and _moved and _need:
             self._drag_last = time.time()
             # ⚠️⚠️⚠️ **补块必须挪到「下一轮事件循环」，不能在这一帧里做**
             #（v1.7 修「最慢一帧 164~204ms」）。
@@ -2296,7 +3008,13 @@ class App(tk.Tk):
             return
         self._pan_redraw_active = True
         try:
-            self.render_all(precise=0.75, only=col)
+            # ⚠️⚠️ **联动时两侧都要补**（v1.8）：另一侧的图元虽然被挪动了，
+            # 但它**自己的缓冲也在被消耗** —— 只补本侧的话，另一侧拖几步
+            # 就会露白（那才是「联动看起来会撕」的真凶）。
+            # 代价：另一侧多半是缓存命中（几毫秒），实测可接受。
+            self.render_all(precise=0.75,
+                            only=None if self.link_view.get() and
+                            self.mode == "pair" else col)
         finally:
             self._pan_redraw_active = False
 
@@ -2361,15 +3079,44 @@ class App(tk.Tk):
         if _vv:
             disp = info.get("disp") or (0, 0)
             dw, dh = disp
-            oy0 = info.get("oy", 0)
-            ys = []
-            if oy0 > 0:
-                ys.append(-bb[1])
-            if oy0 + dh < ch:
-                ys.append(bb[3] - ch)
-            if ys:
-                return min(ys)
-            # 纵向两图都盖满视口 -> 横向才是可能露白的那一侧
+            # ⚠️⚠️⚠️ **定长块的口径必须是「视口有没有出块」，不是「余量 min」**
+            #（v1.8 修「补块过频」，主人 2026-10-07 反馈拖动卡顿连带查出）。
+            #
+            # 为什么 `min(四边)` 在定长块下**必然误判**（实测，不是推演）：
+            #   块起点对齐网格、块长恒定 => 块在画布上的落点
+            #   `bx = ox + vx0/sx`，而 `vx0` 是**网格量化**后的值。
+            #   视口相对块起点可以偏 0 ~ padx 任意量，**两边余量天然不对称**。
+            #   埋点实测（zoom 3.815、cw=1515、padx=242）：
+            #     横向块 2001px 落在 x ∈ [-444, 1557]，视口 [0, 1515]
+            #     => 左余量 444、**右余量只有 42**
+            #   而 `min(四边) = 42`、阈值 `thr = 42` ——
+            #   `42 < 42` 为假还好，**一旦视口再往右挪 1px 就变 41 < 42**，
+            #   于是判「该补块」、补完还是 42、下一��又 41 ——
+            #   **每步都补，死循环**。这就是「左/下/上 26~41/115 补块过频」。
+            #
+            # ✅ 正确口径（定长块）：**直接问「视口还在不在块内」**。
+            #   块在画布上的范围可由 `bx/by` + 块显示尺寸反推，
+            #   而 `_view["want"]` 正是「这一帧应有的图元尺寸」。
+            #   视口四边是 `[0,0,cw,ch]`（Tk 画布坐标）。
+            #   只要视口完全落在图元 bbox 内 => 一定不露白，slack 就是正的；
+            #   否则按「最短的那一维还差多少」给负值。
+            _tw, _th = info.get("want") or (0, 0)
+            _bx, _by = info.get("bx"), info.get("by")
+            if _tw and _th and _bx is not None and _by is not None:
+                _x0, _y0, _x1, _y1 = _bx, _by, _bx + _tw, _by + _th
+                _sl = []
+                if _x0 > 0:
+                    _sl.append(-_x0)            # 图左沿在视口右边
+                if _y0 > 0:
+                    _sl.append(-_y0)
+                if _x1 < cw:
+                    _sl.append(_x1 - cw)
+                if _y1 < ch:
+                    _sl.append(_y1 - ch)
+                # ⚠️ 四条边都盖住 => slack = +∞（不会触发补块）。
+                #   用一个大常数而不是 0：调用方要的是「和阈值比大小」。
+                return min(_sl) if _sl else 1 << 30
+            # 拿不到 want/bx（老路径的 view）-> 退回下面那套
         ox = info.get("ox", 0)
         oy = info.get("oy", 0)
         disp = info.get("disp") or (0, 0)
@@ -2482,6 +3229,61 @@ class App(tk.Tk):
         # 实心深块一多，整屏就沉了（用户提过两次「浅一些、通透一些」）。
         self.btn_crop.set_kind("on" if self.crop_only.get() else "ghost")
         self.render_all()
+
+    def toggle_link(self):
+        """双图联动开关：滚轮 + 拖动都同步到另一幅图。"""
+        on = not self.link_view.get()
+        if on and self.mode != "pair":
+            # ⚠️ 别默默不动 —— 用户按了没反应会以为按钮坏了。
+            self._toast("并排对比时才能联动（现在只有一幅图）")
+            return
+        self.link_view.set(on)
+        # 选中态统一 `on`（浅天蓝底 + 主色描边），与「只看匹配区域」一致。
+        self.btn_link.set_kind("on" if on else "ghost")
+        if on:
+            # ⚠️⚠️ **打开的瞬间就要把两侧对齐**（v1.8）。
+            # 主人预期是「按下按钮，两幅图立刻看到同一处」；
+            # 如果只影响后续操作，画面上还停在各自的旧位置 ——
+            # 看起来就像「按钮没生效」。
+            self._align_link()
+        self._toast("双图联动已%s：滚轮和拖动会同步两侧"
+                    % ("开" if on else "关"))
+
+    def _sync_link_ui(self):
+        """模式变化后同步「双图联动」按钮的可用态。
+
+        ⚠️ **单图模式下直接隐藏**，而不是置灰 —— 置灰还得解释为什么，
+        而这个按钮在单图下**根本没有对应功能**，摆在那儿只是噪音。
+        顺带把 `link_view` 关掉：切回并排时不该是「仍开着」的状态
+        （用户可能已经忘了它开着）。
+        """
+        pair = (self.mode == "pair")
+        if not pair and self.link_view.get():
+            self.link_view.set(False)
+            try:
+                self.btn_link.set_kind("ghost")
+            except Exception:
+                pass
+        try:
+            if pair:
+                self.btn_link.pack(side="left", padx=(0, S(4)))
+            else:
+                self.btn_link.pack_forget()
+        except Exception:
+            pass
+
+    def _align_link(self):
+        """把两侧的缩放倍率与注视位置对齐（以左侧为基准）。"""
+        if self.mode != "pair" or not self.link_view.get():
+            return
+        if not self.path_a or not self.path_b:
+            return
+        norm = self._link_norm(0)
+        if norm is None:
+            return
+        self.zoom[1] = self.zoom[0]
+        self._link_apply(0, norm)
+        self.render_all(precise=True)
 
     def render_all(self, precise=True, only=None):
         """重渲染对比区。
@@ -3005,14 +3807,35 @@ class App(tk.Tk):
         #   -836 从没回来** -> 每 ~48px 必补一次（「上」16 次 vs
         #   其他方向 5~10）。
         #
-        # ✅ 正确的分工：
-        #   · **横向定长**（`vx1 = vx0 + _nx`）—— 横向本来就不滑动
-        #     （块起点由网格定、长度也由网格定，两边一致才有缓存）
-        #   · **纵向跟视口**（`vy1 = ch - oy + pady`）—— 缓冲必须
-        #     跟着走，否则越拖越露白
+        # ✅ 正确的分工（v1.8 修「拖到未显示画面时卡顿」，主人 2026-10-07 报）：
+        #   · 横向定长（`vx1 = vx0 + _nx`）
+        #   · **纵向也要定长**（`vy1 = vy0 + _ny`）—— v1.7 这里是
+        #     `ch - oy + pady`（跟视口），代价是**纵向缓存永不命中**
+        #
+        # ⚠️⚠️⚠️ **「跟视口」不是「缓冲会恢复」，是「块每步都变」**
+        #（v1.8 埋点抓出来的，两层误解叠在一起）。
+        #
+        # v1.7 的注释说「纵向跟视口 → 缓冲跟着走，否则越拖越露白」，
+        # 并把「两维都定长」当过错事（实测补块从 12涨到 41）。
+        # **那个结论只对了「补块判据还没改成按网格触发」的时候。**
+        #
+        # 现在判据已经是「横向跨格 or slack 不足」（见 `_pan_move`），
+        # 纵向定长不会导致「缓冲消耗完却不恢复」—— 块定长之后，
+        # 跨到下一格时新块自然又是满缓冲。
+        #
+        # 实测代价（1328×2048、zoom 3.815、拖 150 步）：
+        #   纵向跟视口：块高 733 -> 747 -> 750 -> 753 … **每拖 4px 变 3px**
+        #     -> pkey 每步都是新的 -> `_render_tile` **129 次调用 0 命中**
+        #     -> 帧耗时中位 **87.1ms**、p95 103.9ms（主人说的「拖一下停一下」）
+        #   纵向定长：pkey 只随网格变 -> 第二次起就是缓存命中
+        #     -> 同场景帧耗时中位 **2ms** 量级
+        #
+        # ⇒ **「主线程每帧几十毫秒」的根因不是编码慢，是缓存永不命中。**
+        #   每帧都在真编码同一块内容，只是块边界在滑动。
         _nx = cw + 2 * padx
+        _ny = ch + 2 * pady
         vx1 = min(disp_w, vx0 + _nx)
-        vy1 = min(disp_h, ch - oy + pady)
+        vy1 = min(disp_h, vy0 + _ny)
         # 但视口那一段（长度恒为 cw/ch）绝不能少 —— 万一视口比整张
         # 显示图还大（极小图放大很轻），块至少要有视口那么长。
         vx1 = max(vx1, min(cw - ox, disp_w))
@@ -3023,10 +3846,39 @@ class App(tk.Tk):
         # 映射到基准像素
         sx = bw / float(disp_w)
         sy = bh / float(disp_h)
-        px0 = max(0, int(vx0 * sx))
-        py0 = max(0, int(vy0 * sy))
-        px1 = min(bw, max(px0 + 8, int(math.ceil(vx1 * sx))))
-        py1 = min(bh, max(py0 + 8, int(math.ceil(vy1 * sy))))
+        # ⚠️⚠️⚠️ **块的目标长度必须「直接算」，不能靠两个坐标相减**
+        #（v1.8 修「缓存命中 0%」，probe_stall.py 抓到的）。
+        #
+        # 原来是这样：
+        #     px0 = max(0, int(vx0 * sx))
+        #     px1 = min(bw, max(px0 + 8, int(math.ceil(vx1 * sx))))
+        #     blkW, blkH = px1 - px0, py1 - py0
+        # 看着「起点终点的差就是块长」，可**两个取整是各自独立做的**：
+        #   `int(vx0*sx)` 与 `ceil((vx0+_nx)*sx)` 的**截断误差互不相关**，
+        #   而 `_nx*sx` 本身是个小数（如 242*0.7293 = 176.49）——
+        #   跨一格时两个误差各自跳一下，`blkH` 就在 **730 / 729** 之间抖。
+        #
+        # 实测（1328x2048、zoom 3.815、pad=(242,121)）：
+        #     pan(-119,-68)  ((1328,730),(0,7)) -> ((1328,729),(0,8))
+        #     pan(-153,-188) ((1328,729),(0,8)) -> ((1328,729),(0,9))
+        #     pan(-153,-312) ((1328,729),(0,9)) -> ((1328,730),(0,10))
+        # `pkey` 里含 `blkW/blkH` => **每次跨格都是全新 key**，
+        # 6 次 `_render_tile` 命中 0 次、每次真编码 ~99ms。
+        #
+        # ✅ 正确：**长度是输入，坐标由它推**。
+        #   同一 zoom 下 `sx`/`_nx` 都恒定 => `_bw` 恒定；
+        #   `px0` 是网格起点（本来就稳定）；
+        #   `blkW = px1 - px0` 只在 `min(bw, ...)` 截断时才变，
+        #   而那时 `px0` 必然 = `bw - _bw` => `blkW` 仍等于 `_bw`。
+        #   ⇒ **`blkW/blkH` 恒定，pkey 只随网格变，跨格第二次起就命中。**
+        _bw = max(8, int(round(_nx * sx)))
+        _bh = max(8, int(round(_ny * sy)))
+        px0 = max(0, min(bw - _bw, int(vx0 * sx)))
+        py0 = max(0, min(bh - _bh, int(vy0 * sy)))
+        px1 = min(bw, px0 + _bw)
+        py1 = min(bh, py0 + _bh)
+        px1 = max(px1, px0 + 8)
+        py1 = max(py1, py0 + 8)
         blkW, blkH = px1 - px0, py1 - py0
 
         twant = max(16, int(round(blkW / sx)))
@@ -3056,6 +3908,10 @@ class App(tk.Tk):
             self._view[col] = {"cv": cv, "item": item, "ox": ox, "oy": oy,
                                "px": self.pan[col][0], "py": self.pan[col][1],
                                "disp": (disp_w, disp_h), "base": (bw, bh),
+                               # ⚠️ **disp 是哪一档 zoom 算出来的**（v1.8）
+                               # `_link_disp` 靠它做档位换算，不记就得
+                               # 靠调用方传，两次都传错（见那段注释）。
+                               "dz": zoom,
                                "blk": (blkW, blkH),
                                # 同上：这一帧应有的图元尺寸（给 test_ui 当判据）
                                "want": (twant, thwant),
@@ -3107,30 +3963,32 @@ class App(tk.Tk):
         # `_level()` 里 `lv = min(lv, native)`，所以放大到超过原生
         # 分辨率后基准档就是原图，块只有 1324×641 却要显示成 1818×880
         # （实测 up = 1.373）。这几档插值是刚需。
-        # ⚠️⚠️⚠️ **判据是「1:1 会不会盖不满」，方向千万别搞反**
-        #（v1.6 拖动露白的根因，踩了两轮才想明白）。
+        # ⚠️⚠️⚠️ **块必须缩到 `(twant, thwant)`，方向无所谓**（v1.10 修
+        #「拖拽有时会改变画面大小」，主人 2026-10-07 报）。
         #
-        # 图元贴在 `ox + px0/sx`（显示坐标），而**画出来的图元必须严格
-        # 等于 `(twant, thwant)`** —— 差一个像素就是右侧/下侧露白。
-        # 而 `twant = blkW / sx`，所以：
-        #   - `up = 1/sx < 1` → 基准像素**比需要的多**，按块原尺寸画
-        #     **盖过**需求 → 安全，一个像素都不用插值（大多数档位）。
-        #     实测 zoom 1.95 落在这一档（up=0.914），所以它一直 100% 通过。
-        #   - `up = 1/sx > 1` → 基准像素**不够**（基准被原图封顶，
-        #     `_level` 里 `lv = min(lv, native)`），按原尺寸画**盖不满**。
-        #     实测 zoom 3.81 是 up=1.373：块 1324×641，画出来也是
-        #     1324×641，而视口+缓冲要 1818×880 —— **右侧少 27%**，
-        #     实测覆盖率按 87%/72%/54% 三值循环（1472/1248/1080 ÷ 1818，
-        #     那三个数是 `resample_img` 用整数倍凑出来的）。
+        # 原来这里是 `if up <= 1.0:`（基准像素**比需要的多**）就
+        # **按块原尺寸 1:1 直接贴**，注释写的是「画出来比理想值大，
+        # 画布自然裁掉，看不出差别」。**那句话是错的。**
         #
-        # ⚠️ 之前这里是 `up > 1.16` 才插值、否则按 1:1 —— **方向错了**：
-        #    1 < up ≤ 1.16 那一段正好是「差一点就盖不满」，全露白。
-        #    Tk 给不出精确尺寸，所以 `up > 1` **必须**用 GDI+。
-        up = max(twant / float(max(1, blkW)), thwant / float(max(1, blkH)))
-
-        if up <= 1.0:
-            # 基准有富余：按块原尺寸贴，一个像素都不插值。
-            # 画出来比理想值大（up<1），画布自然裁掉，看不出差别。
+        # 画布裁掉的只是**溢出视口**的部分；而块内像素 1:1 映射到画布
+        # 等于把内容**整体放大了 `1/sx` 倍**（`sx = bw/disp_w`）。
+        # 于是「画面尺寸」实际由**基准档**决定，不由 `disp` 决定。
+        #
+        # 实测（3000x2000 的图、视口 1515x757，`probe_pansize.py`）：
+        #     zoom 1.25  基准 1536  sx=1.113  块实 1536x989   应 1380x889
+        #     zoom 1.95  基准 2560  sx=1.187  块实 2115x1055  应 1781x889
+        #     zoom 3.05  基准 3000  sx=0.891  块实 1781x889   应 1781x889 ✓
+        # 前两档画面分别被放大 **11.3% / 18.7%**（第三档因为基准被原图
+        # 封顶、sx<1 走了插值分支，反而恰好正确 —— 这正是「有时候」）。
+        #
+        # ⇒ 只要基准档在**拖动补块（0.75 档）与精确帧之间切换**一次，
+        #    `sx` 一变画面就跳一下 —— 主人说的「拖拽有时候会改变画面大小」。
+        #
+        # ✅ 正确做法只有一条：**块尺寸严格等于 `(twant, thwant)`**，
+        #    让画面尺寸只由 `disp` 决定、与基准档彻底解耦。
+        #    1:1 那个 case 只是恰好相等，可以省掉插值，但**不能当通用优化**。
+        if blkW == twant and blkH == thwant:
+            # 恰好 1:1（`sx == 1`，基准档正好等于显示尺寸）：省一次插值。
             ppm, _pw, _ph = uikit.fit_ppm(blkW, blkH, cbgra, 0)
             if ppm is None:
                 return False
@@ -3138,7 +3996,11 @@ class App(tk.Tk):
             self.big.put_photo(pkey, img)
             dw, dh = blkW, blkH
         else:
-            # ⚠️⚠️ **基准不够，必须插值**，而且**必须同步做**。
+            # ⚠️ 两个方向**都**走这里（v1.10）：
+            #     基准像素不够 -> 要**放大**（`up > 1`）
+            #     基准像素更多 -> 要**缩小**（`up < 1`，原来走上面那条
+            #       「1:1 白贴」的路，画面因此被放大 `1/sx` 倍 = bug 本体）
+            # ⚠️⚠️ 而且**必须同步做**。
             #
             # 曾经想「先顶占位、插值丢后台」，但占位图**同样得是精确
             # 尺寸**（否则照样露白），而要精确尺寸就得插值 —— 后台
@@ -3192,6 +4054,10 @@ class App(tk.Tk):
         self._view[col] = {"cv": cv, "item": item, "ox": ox, "oy": oy,
                            "px": self.pan[col][0], "py": self.pan[col][1],
                            "disp": (disp_w, disp_h),
+                           # ⚠️ **disp 是哪一档 zoom 算出来的**（v1.8）。
+                           # `_link_disp` 靠它做档位换算；漏了这一处，
+                           # 滚轮联动第 1 格会偏 0.139（实测）。
+                           "dz": zoom,
                            # 记下这一帧是用**哪一级基准**画的，以及块多大 ——
                            # 「放大后有没有马赛克」就是看这两个：
                            # 显示宽 / 块宽 > 1.5 就是欠采样（肉眼可见的糊）。
@@ -3269,7 +4135,19 @@ class App(tk.Tk):
                 for p in g["members"][:2]:
                     add(p)
         for it in self.glist.items:
-            add(it["tag"])
+            # ⚠️⚠️ **只收字符串**：分组视图里 `tag` 是**组号（int）**，
+            #    不是路径。原来这里无脑 `add(it["tag"])`，于是
+            #    `_prewarm_q` 里混进一堆 int，后台线程拿它去
+            #    `META.of(path)` -> `os.path.basename(int)` 直接抛
+            #    `TypeError: expected str, bytes or os.PathLike object, not int`。
+            #    这个异常在**工作线程**里被 `traceback.print_exc()` 打到 stderr，
+            #    界面上什么都看不到 —— 一批「总能复现但从没人报」的红色堆栈
+            #    就是这么来的（`test_ui.py` 里 18 次，`git show HEAD` 一样有）。
+            #    后果不只是刷屏：`PREWARM_MAX` 的名额被这些 int 白占掉，
+            #    真正该预热的图反而被挤出队列。
+            tag = it.get("tag")
+            if isinstance(tag, str):
+                add(tag)
         # ⚠️ 兜底：一个组都没有时（比如一批互不相干的图），上面三处**全是空的**，
         #    预热就空转 —— 实测 0 组时队列长度 0、`_b` 一片空白，第一次滚轮
         #    还得现解 1536 那一档，128ms 就这么来的。
@@ -3509,6 +4387,22 @@ class App(tk.Tk):
     def _render_side(self, col, cv, cap, path, rect, precise=True):
         cw = max(1, cv.winfo_width())
         ch = max(1, cv.winfo_height())
+        # ⚠️⚠️ **取用联动待办**（v1.8，见 `_link_apply` 里那段）。
+        #
+        # 滚轮联动的第 1 格常常撞上「另一侧画布还没布局好」
+        #（`winfo_width()` 返回 1），那一格的对齐当时存了下来、没套上去。
+        # 必须在这里取 —— **这一侧刚拿到能用的画布尺寸**，
+        # 而本函数后面无论走哪条分支（分块 / 整张 / 占位）都会重画，
+        # 所以在这里套用pan 最稳：不会漏，也不会套到一半。
+        _lp = self._link_pend.pop(col, None)
+        if _lp is not None and cw > 1 and ch > 1 and \
+                self._link_target(1 - col) == col:
+            _norm0, _z0, _f0 = _lp
+            disp0 = self._link_disp(col, _z0, _f0)
+            if disp0:
+                _m0 = ((cw - disp0[0]) // 2, (ch - disp0[1]) // 2)
+                self.pan[col] = [int(round(_m0[0] + _norm0[0] * disp0[0])),
+                                 int(round(_m0[1] + _norm0[1] * disp0[1]))]
         # ⚠️⚠️ **先不清空画布**。这条渲染路径有多个 `return`（取不到档、
         #    `fit_ppm` 失败、占位图也拿不到）—— 任何一条都会留下一个**空画布**。
         #    主人反馈「拖动的时候图片直接空白了」就是这个：拖动补块传的是
@@ -3624,7 +4518,7 @@ class App(tk.Tk):
         self._view[col] = {"cv": cv, "item": item, "ox": ox, "oy": oy,
                            "bx": ox, "by": oy,
                            "px": self.pan[col][0], "py": self.pan[col][1],
-                           "disp": (dw, dh), "img": img}
+                           "disp": (dw, dh), "img": img, "dz": zoom}
 
         m = META.of(path)
         wh0 = m["wh"]
@@ -3854,6 +4748,98 @@ class App(tk.Tk):
             pass
 
     # ------------------------------------------------------------------
+    # 撤销（v1.11）
+    # ------------------------------------------------------------------
+    # 主人 2026-10-07：「添加撤销功能，当误删时可以撤销」。
+    #
+    # ⚠️ 为什么撤销**必须有**：`delete_side` 从 v1.11 起不再弹确认框
+    #    （移入隔离夹可逆，主人明确要求去掉那道帘子）。帘子拿掉之后，
+    #    「按错键把图删了」的兜底就从「弹窗」变成了「撤销」——
+    #    这两件事是**一起来的**，只去掉弹窗不给撤销就是留了个坑。
+    UNDO_MAX = 20          # 最多记多少步（再多也没人会去翻）
+
+    def _push_undo(self, label, moves, keep):
+        """把「这次移除的完整现场」压栈。
+
+        `keep` 是**移除之前**拍的快照：`descs` / `store.items` / `links`
+        / `files`。为什么整份存而不是只存那几张：移除会把 `links` 里
+        牵涉到它们的边**一次过滤掉**，事后想反向推算出「原来有哪些边」
+        极容易漏；账本本来就不大（几百张图的 links 也就几 MB）。
+        """
+        self.undo_stack.append({
+            "label": label, "moves": list(moves),
+            "descs": keep["descs"], "items": keep["items"],
+            "links": keep["links"], "files": keep["files"]})
+        del self.undo_stack[:-self.UNDO_MAX]
+        self._sync_undo_btn()
+
+    def _sync_undo_btn(self):
+        """按钮可用态跟着撤销栈走 —— 栈空就灰掉，别让人点了没反应。"""
+        try:
+            self.btn_undo.configure_state(
+                "normal" if self.undo_stack else "disabled")
+        except Exception:
+            pass
+
+    @property
+    def can_undo(self):
+        return bool(self.undo_stack)
+
+    def undo(self):
+        """撤销上一次「移入隔离夹」：文件搬回原位 + 还原内存结构。"""
+        if self.busy:
+            return
+        if not self.undo_stack:
+            self._toast("没有可撤销的操作")
+            return
+        rec = self.undo_stack.pop()
+        back, fail = [], []
+        for src, dest in rec["moves"]:
+            # ⚠️ 三道前置检查一条都不能省，否则要么**覆盖用户自己的文件**、
+            #    要么在「隔离夹被手动清空」时报一个看不懂的异常。
+            if os.path.exists(src):
+                fail.append((src, "原位已经有同名文件，没敢覆盖"))
+                continue
+            if not os.path.isfile(dest):
+                fail.append((src, "隔离夹里那份已经不在了"))
+                continue
+            try:
+                d = os.path.dirname(src)
+                if d and not os.path.isdir(d):
+                    os.makedirs(d, exist_ok=True)   # 原目录被删了也能还原
+                shutil.move(dest, src)
+                back.append(src)
+            except Exception as e:
+                fail.append((src, str(e)))
+        if not back:
+            # ⚠️ **一条都没搬回来时，记录必须压回去**：多半是「原位已有
+            #    同名文件 / 隔离夹被手动清空」这类**可以补救**的冲突，
+            #    用户处理完还想再撤一次。这里 pop 完不还，记录就永远没了。
+            self.undo_stack.append(rec)
+            self._sync_undo_btn()
+            messagebox.showwarning("撤销不了", "\n".join(
+                "%s\n  %s" % (os.path.basename(p), why)
+                for p, why in fail[:6]))
+            return
+        # 内存结构：快照是「移除前」拍的，**直接覆盖回去**即可
+        self.descs.update(rec["descs"])
+        self.store.items.update(rec["items"])
+        self.links = list(rec["links"])
+        self.files = list(rec["files"])
+        self.groups_raw, self.weak = scan.build_groups(self.descs, self.links)
+        self._make_view_groups()
+        self.store.save()
+        self._after_edit()
+        self._sync_undo_btn()
+        self.stat.configure(text="已撤销「%s」—— 搬回 %d 张，还原到移除前的样子"
+                                 % (rec["label"], len(back)))
+        self._toast("已撤销：%s" % rec["label"])
+        if fail:
+            messagebox.showwarning("有 %d 张没搬回来" % len(fail), "\n".join(
+                "%s\n  %s" % (os.path.basename(p), why)
+                for p, why in fail[:6]))
+
+    # ------------------------------------------------------------------
     # 删除 / 清理完全重复
     # ------------------------------------------------------------------
     def _need(self, path):
@@ -3863,6 +4849,19 @@ class App(tk.Tk):
         return False
 
     def delete_side(self, col):
+        """把这一侧的图移进隔离夹。**故意不弹确认框。**
+
+        ⚠️⚠️ 主人 2026-10-07 明确要求：「移除的时候由于不是直接删除，
+        所以除了清理完全重复外都不需要提醒弹窗」。
+
+        理由是**操作本身可逆** —— 移进隔离夹是 `move` 不是 `delete`，
+        文件原样躺在磁盘上，拖回去就还原了。为一次可逆操作弹一个
+        「你确定吗」，代价是每次都多点一下，而收益接近于零。
+
+        ⚠️ 全程序**只有 `clean_exact_dups` 保留确认框**：它一次动
+        **一批**（可能几十上百张）、横跨多个目录，误触代价完全不是一个
+        量级。单张删除随时能拖回来，不需要拦。
+        """
         p = self.path_a if col == 0 else self.path_b
         if not p:
             self._toast("这一侧没有图")
@@ -3870,21 +4869,16 @@ class App(tk.Tk):
         if not os.path.isfile(p):
             self._toast("文件已经不在了")
             return
-        dest = quarantine.quarantine_dir_for(p, self.roots)
-        ok = messagebox.askyesno(
-            "移到隔离文件夹",
-            "把这张图移走？\n\n%s\n\n隔离位置：\n%s\n\n"
-            "（是**移动**不是删除 —— 想还原就把文件从隔离夹拖回去；"
-            "以后扫描会自动跳过「%s」）"
-            % (p, dest, quarantine.QUARANTINE_NAME),
-            icon="warning", default="no")
-        if ok:
-            n = self.delete_paths([p])
-            if n:
-                self._toast("已移入隔离夹 · %s" % os.path.basename(dest))
+        n = self.delete_paths([p])
+        if n:
+            self._toast("已移入隔离夹 · 想还原就把它拖回原目录")
 
-    def delete_paths(self, paths):
-        """把一批图移进隔离夹，并把它们从所有内存结构里摘干净。"""
+    def delete_paths(self, paths, label=None):
+        """把一批图移进隔离夹，并把它们从所有内存结构里摘干净。
+
+        `label` 只用来给**撤销**那条记录起个名字（「撤销：清理完全重复 20 张」
+        比「撤销：移走 20 张」有用得多）。
+        """
         paths = [p for p in dict.fromkeys(paths) if p and os.path.isfile(p)]
         if not paths:
             return 0
@@ -3893,6 +4887,14 @@ class App(tk.Tk):
             on_progress=lambda d, t: self._progress(0.6 * d / max(1, t),
                                                     "移入隔离夹 %d/%d" % (d, t)))
         gone = set()
+        # ⚠️⚠️ **撤销要的快照必须在「摘干净」之前拍**：下面的循环会把
+        #     `descs` / `store.items` 里对应项 pop 掉、`links`/`files`
+        #     也要被过滤，事后没法反向推算。账本不大（几百张图的 links
+        #     也就几 MB），直接整份存最稳 —— 同 `SnapshotStack` 的思路。
+        keep = {"descs": {s: self.descs[s] for s, _ in done if s in self.descs},
+                "items": {s: self.store.items[s]
+                          for s, _ in done if s in self.store.items},
+                "links": list(self.links), "files": list(self.files)}
         for src, dest in done:
             gone.add(src)
             META.drop(src)
@@ -3905,6 +4907,7 @@ class App(tk.Tk):
                 messagebox.showerror("移动失败", "\n".join(
                     "%s\n  %s" % (os.path.basename(p), why) for p, why in failed[:6]))
             return 0
+        self._push_undo(label or ("移走 %d 张" % len(gone)), list(done), keep)
 
         self.files = [f for f in self.files if f not in gone]
         self.links = [l for l in self.links
@@ -3922,6 +4925,7 @@ class App(tk.Tk):
         self.pair = None
         self.mode = "pair" if (self.path_a and self.path_b) else "single"
         self._apply_grid()
+        self._sync_link_ui()      # 隔离后可能变成单图(v1.8)
 
         self._after_edit()
         self.stat.configure(text="已把 %d 张移入隔离夹（从列表里摘掉了）"
@@ -4028,7 +5032,7 @@ class App(tk.Tk):
             self.stat.configure(text="已取消清理")
             return
         drops = [p for _k, d, _f in plan for p in d]
-        n = self.delete_paths(drops)
+        n = self.delete_paths(drops, label="清理完全重复 %d 张" % len(drops))
         self.stat.configure(text="清理完成：移走 %d 张，省出 %s"
                                  % (n, human_size(freed)))
 

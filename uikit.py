@@ -412,6 +412,7 @@ def clear_photo_caches():
     _BTN_CACHE.clear()
     _CARD_CACHE.clear()
     _ROW_CACHE.clear()
+    _SB_CACHE.clear()
 
 
 def rounded_photo(root, w, h, r, **kw):
@@ -1038,6 +1039,8 @@ class Card(tk.Canvas):
 # ---------------------------------------------------------------------------
 
 _ROW_CACHE = {}
+# 下拉条滑块的小圆角图（按 宽/高/色 缓存 —— 拖动时每帧都要，不能现造）
+_SB_CACHE = {}
 
 
 class NiceList(tk.Canvas):
@@ -1055,11 +1058,38 @@ class NiceList(tk.Canvas):
                 （"poor" 用来**强调质量差的图**）
         badge   行尾的小徽章文字（如「低清」「体积小」），None 就不画
         tag     任意数据，回调时原样带回
+
+    ⚠️⚠️⚠️ **只画可见行（虚拟化）**（v1.9，主人 2026-10-07 报
+    「加载 400 图片就会很慢很卡了」）。
+
+    原来 `redraw()` 是 `for i in range(len(self.items))` —— **无条件画全部行**。
+    400 项就是 400 × 约 5 个画布图元 = **2001 个图元**（实测），
+    而屏幕只显示得下十几行，其余全是白画的。代价体现在两处：
+      · 每次 `set_items` / `_redraw_rows` / `<Configure>` 都要重来一遍
+      · 画布图元一多，Tk 自己的命中测试与重绘也变慢
+    现在只画「可见范围 ± 1 行」，**图元数只跟可见行数有关、与项数无关**。
+    滚动时靠 `-yscrollcommand` 通知：范围没变就**直接返回**（不然每滚
+    1px 都重画，比原来还慢）。
+
+    ⚠️ 顺带加了**可见的下拉条**。主人：「左边选图只能鼠标下滑，如果图片
+    太多会很难查看最下面的分组，可以添加下拉条，方便快速下滑。」
+    没有用 `ttk.Scrollbar`（那个灰框跟整套自绘风格不搭），
+    而是在**同一个画布**上自绘一条细的圆角滑块：
+      · 拖滑块 -> 精确滚动
+      · 点轨道 -> 翻一屏
+      · 滚轮 -> 一次 3 行
+    内容装得下时**不画**（免得空列表右边挂一根孤零零的条）。
     """
 
     GAP = 2
+    # 下拉条（设计稿像素，经 sc() 换算）
+    SB_W = 7            # 槽宽
+    SB_MIN = 26         # 滑块最短（内容极长时也不能细到抓不住）
+    SB_PAD = 3          # 离右边缘留白
+    SB_HIT = 2          # 命中判定额外放宽，好抓
 
-    def __init__(self, master, on_pick=None, on_activate=None, row_h=54,
+    def __init__(self, master, on_pick=None, on_activate=None, on_repick=None,
+                 row_h=54,
                  thumb=40, page=None, radius=11, size=9, empty_text="",
                  **kw):
         self.page = page or Palette.PAGE
@@ -1069,33 +1099,116 @@ class NiceList(tk.Canvas):
         self.gap = sc(self.GAP)
         self.on_pick = on_pick
         self.on_activate = on_activate
+        # ⚠️ **再点一次已选中行**时回调（`select()` 对同一行会直接 return，
+        #    所以 `on_pick` 收不到这次点击）。单独给一个通道，而不是让
+        #    `on_pick` 无条件重复触发 —— 别的列表（分组）靠 `select` 的
+        #    「同一行不重复通知」挡掉无谓的重渲染，不能一刀切改掉。
+        self.on_repick = on_repick
         self.empty_text = empty_text
         self.items = []
         self.sel = -1
         self.hover = -1
         self._refs = []
+        self._vis = (0, 0)          # 当前已画的可见行范围 [i0, i1)
+        self._sb = None             # 滑块几何 (y0, y1)；None = 不需要 / 没画
+        self._sb_drag = None        # 拖动中：按下点相对滑块顶端的偏移
+        self._sb_hover = False
+        self._painting = False      # 重入锁（见 `_repaint`）
+        self._sbw = max(3, sc(self.SB_W))
         self.f_t = ui_font(master, size)
         self.f_tb = ui_font(master, size, True)
         self.f_s = ui_font(master, max(7, size - 1))
         super().__init__(master, bg=self.page, highlightthickness=0, bd=0, **kw)
+        # ⚠️ `yscrollincrement=1` 让 `yview_scroll(n, "units")` 正好滚 n 像素
+        #    （默认 0 时 "units" 是「窗口高度的 1/10」，滚轮一下跳得太远）。
+        self.configure(yscrollincrement=1)
+        # ⚠️ `-yscrollcommand` 是画布自己的选项（跟 Scrollbar 用的那个同名），
+        #    视口一变就会被调用 —— 虚拟化就靠它知道「该换哪几行」。
+        self.configure(yscrollcommand=self._on_yscroll)
         self.bind("<Configure>", lambda e: self.redraw())
         self.bind("<Button-1>", self._click)
+        self.bind("<B1-Motion>", self._drag)
+        self.bind("<ButtonRelease-1>", self._release)
         self.bind("<Double-Button-1>", self._dbl)
         self.bind("<Motion>", self._motion)
         self.bind("<Leave>", self._leave)
         self.bind("<MouseWheel>", self._wheel)
+
+    # -- 虚拟化几何 ------------------------------------------------------
+    def _pitch(self):
+        return self.row_h + self.gap
+
+    def _content_h(self):
+        return len(self.items) * self._pitch()
+
+    def _visible_range(self):
+        """当前视口覆盖到的行范围 `[i0, i1)`，上下各多留 1 行做缓冲。"""
+        p = self._pitch()
+        top = self._top()
+        H = max(1, self.winfo_height())
+        i0 = max(0, int(top // p) - 1)
+        i1 = min(len(self.items), int((top + H) // p) + 2)
+        return (i0, max(i0, i1))
+
+    def _on_yscroll(self, first, last):
+        """视口变了 -> 重画可见行 + 更新滑块。
+
+        ⚠️⚠️ **范围没变必须立刻返回**。Tk 在每次 `yview` 变化时都会调这里，
+        滚动一次可能触发十几次；不做这个短路的话，每滚 1px 就整段重画，
+        比不做虚拟化还慢（这是我改这一版的第一个坑）。
+
+        ⚠️⚠️ **`_painting` 重入锁也是必需的**：`_repaint()` 里要
+        `configure(scrollregion=...)`，Tk 会再回调一次 `_on_yscroll`；
+        而此时 `_vis` 还没更新成新范围，于是判定「范围变了」-> 又进
+        `_repaint()` -> 又设 scrollregion -> …… 直接爆栈。
+        """
+        if self._painting:
+            return
+        rng = self._visible_range()
+        if rng != self._vis:
+            self._repaint()
+        else:
+            self._draw_thumb()
+
+    def see(self, idx):
+        """把第 idx 行滚进可见范围。
+
+        ⚠️ 虚拟化之后这一条是**必需**的：选中项在视口外时它根本不画，
+        用户按方向键换图却看不到任何变化。
+        """
+        if not (0 <= idx < len(self.items)):
+            return
+        C = self._content_h()
+        H = max(1, self.winfo_height())
+        if C <= H:
+            return
+        p = self._pitch()
+        top = self._top()
+        y = idx * p
+        if y < top:
+            self._set_top(y)
+        elif y + self.row_h > top + H:
+            self._set_top(y + self.row_h - H)
 
     # -- 数据 ------------------------------------------------------------
     def set_items(self, items, keep_sel=False):
         self.items = list(items)
         if not keep_sel or self.sel >= len(self.items):
             self.sel = -1
+        # ⚠️ 换数据前先把视口拉回顶部：不拉的话，上一批的 scrollregion
+        #    在 Tk 里会按比例保留偏移，新数据一来就停在中间（明明是新列表）。
+        self._vis = (-1, -1)          # 强制重画
+        self.yview_moveto(0.0)
         self.redraw()
 
     def select(self, idx, notify=True):
         if idx == self.sel:
             return
         old, self.sel = self.sel, idx
+        # ⚠️ 先 `see`（可能要滚动 -> 触发 `_on_yscroll` -> `_repaint`），
+        #    再局部重画。顺序反了的话，`_repaint` 会把刚画好的选中态覆盖掉。
+        if 0 <= idx < len(self.items):
+            self.see(idx)
         # ⚠️ 只重画「旧选中行 + 新选中行」，不是全表重画。
         #    换选中是**最频繁**的操作（点组、点成员、键盘上下），
         #    全表重画在几十上百项时是纯浪费。
@@ -1111,23 +1224,166 @@ class NiceList(tk.Canvas):
             return self.items[self.sel]
         return None
 
-    # -- 交互 ------------------------------------------------------------
+    # -- 下拉条 ----------------------------------------------------------
+    def _max_top(self):
+        """画布坐标系里视口顶端能到的最大值（内容高 - 视口高）。"""
+        return max(0.0, self._content_h() - max(1, self.winfo_height()))
+
+    def _top(self):
+        """当前视口顶端的画布 y（已夹在 [0, _max_top()]）。"""
+        try:
+            t = self.canvasy(0)
+        except Exception:
+            t = 0.0
+        return max(0.0, min(self._max_top(), t))
+
+    def _set_top(self, top):
+        """滚到画布坐标 top 处。
+
+        ⚠️⚠️ **Tk 的 `yview_moveto(f)` 是 `top = f × 内容高`**，不是
+        `f × (内容高 - 视口高)`。实测：内容 22400 / 视口 420 时
+        `moveto(0.25)` -> `canvasy(0) = 5598 ≈ 0.25 × 22400`。
+        所以「滑块位置 -> 滚动位置」必须**除以内容高**再传。
+        我原来直接 `yview_moveto(y0 / H)`，拖到最底也只滚到
+        `(H - 滑块高) / H × 内容高` —— 差将近一屏（被 P4b 抓到）。
+        """
+        C = max(1.0, float(self._content_h()))
+        self.yview_moveto(max(0.0, min(1.0, top / C)))
+
+    def _thumb_geo(self):
+        """滑块的画布坐标 `(y0, y1)`；内容装得下（或无数据）时返回 None。"""
+        C = self._content_h()
+        H = max(1, self.winfo_height())
+        if not self.items or C <= H + 2:
+            return None
+        th = max(sc(self.SB_MIN), int(H * H / float(C)))
+        th = min(th, H)
+        mt = self._max_top()
+        travel = float(H - th)
+        y0 = int(round(max(0.0, min(travel,
+                                    self._top() / mt * travel if mt > 0 else 0.0))))
+        return (y0, y0 + th)
+
+    def _sb_x(self):
+        W = max(40, self.winfo_width())
+        return W - self._sbw - sc(self.SB_PAD)
+
+    def _sb_at(self, ev):
+        """事件落在哪：'row' / 'thumb' / 'track'。
+
+        ⚠️ 只用 `getattr` 取 `x`/`y`：单测里经常喂一个「只有 y」的假事件
+        （探针/单测不需要真鼠标），直接 `ev.x` 会 AttributeError。
+        取不到 `x` 时当成 -1 -> 判定为 "row"，即「不在下拉条上」，不影响点选。
+        """
+        geo = self._sb
+        if geo is None:
+            return "row"
+        ex = getattr(ev, "x", -1)
+        ey = getattr(ev, "y", -1)
+        x = self._sb_x()
+        if ex < x - sc(self.SB_HIT + 4):
+            return "row"
+        if geo[0] - sc(self.SB_HIT) <= ey <= geo[1] + sc(self.SB_HIT):
+            return "thumb"
+        return "track"
+
+    def _draw_thumb(self):
+        self.delete("sb")
+        geo = self._thumb_geo()
+        self._sb = geo
+        if geo is None:
+            return
+        h = max(6, geo[1] - geo[0])
+        w = self._sbw
+        _on = self._sb_hover or self._sb_drag is not None
+        col = (mix(Palette.BORDER_HI, Palette.TEXT_2, 0.45) if _on
+               else Palette.BORDER_HI)
+        key = ("sb", w, h, col, self.page)
+        img = _SB_CACHE.get(key)
+        if img is None:
+            img = rounded_photo(self, w, h, w // 2, fill=col,
+                                page=self.page, inset=0)
+            _SB_CACHE[key] = img
+        self._refs.append(img)
+        # ⚠️⚠️ **必须加上 `self._top()`**。`_thumb_geo()` 给的是**视口坐标**
+        #    （0..H-th，跟 `_sb_at(ev)` 里的 `ev.y` 同一套），而 `create_image`
+        #    收的是**画布坐标** —— 画布一滚，坐标系就差了一个 `canvasy(0)`。
+        #    第一版漏了这个偏移：滑块被画到视口上方一千多像素处，
+        #    **只有 `top==0`（没滚动过）时才看得见**。
+        #    而 `probe_list` 当时是全绿的 —— 因为它只验了「拖动后 `yview` 对不对」，
+        #    没验「滑块到底有没有画在屏幕上」。这个 bug 是**截图**抓出来的。
+        #    教训：交互正确 ≠ 画出来了，两条都得有判据。
+        self.create_image(self._sb_x(), geo[0] + self._top(), anchor="nw",
+                          image=img, tags="sb")
+
+    # -- 命中测试 --------------------------------------------------------
     def _at(self, ev):
+        """事件落在第几行（不在任何行上返回 -1）。"""
         y = self.canvasy(ev.y)
-        idx = int(y // (self.row_h + self.gap))
+        idx = int(y // self._pitch())
         return idx if 0 <= idx < len(self.items) else -1
 
     def _click(self, ev):
+        where = self._sb_at(ev)
+        if where == "thumb":
+            self._sb_drag = ev.y - self._sb[0]
+            self._sb_hover = True
+            self._draw_thumb()
+            return
+        if where == "track":
+            # 点轨道：往上/往下翻一屏（一屏 = 视口高的内容）
+            H = max(1, self.winfo_height())
+            self._set_top(self._top() + (-H if ev.y < self._sb[0] else H))
+            return
         idx = self._at(ev)
         if idx >= 0:
+            if idx == self.sel:
+                # ⚠️⚠️ 点的是**已经选中**的那一行：`select()` 里
+                #    `if idx == self.sel: return` 会直接吞掉，调用方
+                #    永远收不到 —— 而「再点一下取消这张」（v1.10 的
+                #    `_pick_pair_click`）正是靠这次点击。
+                #    所以补一个专门通道，选中态和位置都不动。
+                if self.on_repick:
+                    self.on_repick(self.items[idx], idx)
+                return
             self.select(idx)
 
+    def _drag(self, ev):
+        if self._sb_drag is None:
+            return
+        geo = self._sb
+        if geo is None:
+            return
+        H = max(1, self.winfo_height())
+        th = geo[1] - geo[0]
+        y0 = max(0.0, min(H - th, ev.y - self._sb_drag))
+        # 滑块行程 <-> 内容行程：线性映射（见 `_set_top` 的注释）
+        self._set_top(y0 / float(max(1.0, H - th)) * self._max_top())
+        self._draw_thumb()
+
+    def _release(self, _ev=None):
+        if self._sb_drag is not None:
+            self._sb_drag = None
+            self._draw_thumb()
+
     def _dbl(self, ev):
+        if self._sb_at(ev) != "row":
+            return
         idx = self._at(ev)
         if idx >= 0 and self.on_activate:
             self.on_activate(self.items[idx], idx)
 
     def _motion(self, ev):
+        where = self._sb_at(ev)
+        hov = where != "row"
+        if hov != self._sb_hover:
+            self._sb_hover = hov
+            self._draw_thumb()
+        if hov:
+            if self.hover != -1:
+                old, self.hover = self.hover, -1
+                self._redraw_rows([old])
+            return
         idx = self._at(ev)
         if idx != self.hover:
             old, self.hover = self.hover, idx
@@ -1137,16 +1393,37 @@ class NiceList(tk.Canvas):
             self._redraw_rows([old, idx])
 
     def _leave(self, _e=None):
+        red = []
         if self.hover != -1:
-            old, self.hover = self.hover, -1
-            self._redraw_rows([old])
+            red.append(self.hover)
+            self.hover = -1
+        if self._sb_hover and self._sb_drag is None:
+            self._sb_hover = False
+            self._draw_thumb()
+        if red:
+            self._redraw_rows(red)
 
     def _redraw_rows(self, idxs):
-        """只重画指定的几行（删掉它们的图元再画一遍）。"""
+        """只重画指定的几行（删掉它们的图元再画一遍）。
+
+        ⚠️ 虚拟化之后要**先判在不在可见范围里**：不可见的行本来就没画，
+        `delete` 无所谓，但 `_draw_row` 会把它们画到视口外面去（白费）。
+        """
+        i0, i1 = self._vis
         for i in set(idxs):
-            if 0 <= i < len(self.items):
+            if i0 <= i < i1 and 0 <= i < len(self.items):
                 self.delete(self._row_tag(i))
                 self._draw_row(i)
+        # ⚠️⚠️ **兜底把滑块提到最上层**（v1.10）。上面那些新画的行是
+        #    在这个 `for` 里 `create_image` 出来的，**后画的盖先画的** ——
+        #    而滑块是上一帧 `_draw_thumb` 画的，于是**选中行的高亮矩形
+        #    正好压在滑块上**（主人截图里就是这样：滑块在选中行处被截断，
+        #    看着像"滚动条被遮挡"）。`select()` 走的正是这条局部重画路径，
+        #    所以每次点一行都会把滑块盖掉一次。
+        #    ⚠️ `_repaint()` 那条全量路径本来就没事（滑块最后画），
+        #       所以这个 bug **只在"点选"时才看得见** —— 又一次说明
+        #       「全量重绘正确」不等于「局部重绘也正确」。
+        self.tag_raise("sb")
         # 局部重画不会像 `redraw()` 那样重置 `_refs`，鼠标长时间在列表上划
         # 会让它无限增长。图本体都在 `_ROW_CACHE` / items 里有强引用，
         # 这里只丢尾部的冗余引用，不会把正在显示的图回收掉。
@@ -1154,9 +1431,9 @@ class NiceList(tk.Canvas):
             self._refs = self._refs[-1000:]
 
     def _wheel(self, ev):
-        total = len(self.items) * (self.row_h + self.gap)
-        if total > self.winfo_height():
-            self.yview_scroll(-1 if ev.delta > 0 else 1, "units")
+        # 一次滚轮 = 3 行（按像素滚，`yscrollincrement=1`）
+        n = 3 * self._pitch()
+        self.yview_scroll(-n if ev.delta > 0 else n, "units")
 
     # -- 绘制 ------------------------------------------------------------
     def _rowbg(self, w, state):
@@ -1190,23 +1467,44 @@ class NiceList(tk.Canvas):
             _ROW_CACHE[key] = got
         return got
 
-    def redraw(self):
-        self.delete("all")
-        self._refs = []
+    def _repaint(self):
+        """清空重画**当前可见的那几行**（虚拟化的核心）。
+
+        ⚠️⚠️ 顺序不能换：
+          1. 先设 `scrollregion` —— `canvasy(0)` 与 `yview` 的比例都靠它，
+             不先设的话第一帧算出的可见范围是上一批数据的。
+          2. 再算 `_visible_range()`（内部读 `canvasy`）。
+          3. 最后画行 + 画滑块。
+        图元总数 = 可见行数 × 约 5 + 1，**与总项数无关**。
+        """
         W = max(40, self.winfo_width())
-        if not self.items:
-            if self.empty_text:
-                self.create_text(W // 2, sc(30), text=self.empty_text,
-                                 fill=Palette.TEXT_3, font=self.f_s,
-                                 width=max(sc(80), W - sc(24)))
-            self.configure(scrollregion=(0, 0, W, sc(60)))
-            return
-        pitch = self.row_h + self.gap
-        pad = sc(8)
-        mid = self.row_h // 2
-        for i in range(len(self.items)):
-            self._draw_row(i, W, pitch, pad, mid)
-        self.configure(scrollregion=(0, 0, W, len(self.items) * pitch))
+        self._painting = True
+        try:
+            self.delete("all")           # 顺带删掉上一帧的 "sb" 滑块
+            self._refs = []
+            if not self.items:
+                self._vis = (0, 0)
+                self._sb = None
+                if self.empty_text:
+                    self.create_text(W // 2, sc(30), text=self.empty_text,
+                                     fill=Palette.TEXT_3, font=self.f_s,
+                                     width=max(sc(80), W - sc(24)))
+                self.configure(scrollregion=(0, 0, W, sc(60)))
+                return
+            p = self._pitch()
+            self.configure(scrollregion=(0, 0, W, len(self.items) * p))
+            rng = self._visible_range()
+            self._vis = rng
+            pad, mid = sc(8), self.row_h // 2
+            for i in range(rng[0], rng[1]):
+                self._draw_row(i, W, p, pad, mid)
+            self._draw_thumb()
+        finally:
+            self._painting = False
+
+    def redraw(self):
+        """整表重画（只画可见行）。空列表也走这条路，少一份分支。"""
+        self._repaint()
 
     def _row_tag(self, i):
         return "row%d" % i
@@ -1226,6 +1524,20 @@ class NiceList(tk.Canvas):
             pad = sc(8)
         if mid is None:
             mid = self.row_h // 2
+        # ⚠️⚠️ **需要滑块时，这一行要让出右侧那条**（v1.10 修「选中行的
+        #    高亮矩形把滑块盖住」，主人 2026-10-07 截图报的）。
+        #
+        # 只加 `tag_raise("sb")` 不够：那样滑块虽然浮在最上面，但行尾的
+        # **徽章和文字会藏到滑块底下**（「体积小」那种徽章正好在右侧），
+        # 看着像被截断。两件事得一起做。
+        #
+        # ⚠️ 判据必须用 `_max_top() > 0`（内容比视口高才需要滑块），
+        #    **不能**用 `self._sb`：它是**上一帧**算出来的，而 `_repaint`
+        #    里是「先画所有行、最后才 `_draw_thumb`」——画行的时候
+        #    `self._sb` 还是旧的，第一屏就会判错。
+        Wr = W
+        if self._max_top() > 0:
+            Wr = max(sc(40), W - self._sbw - sc(self.SB_PAD))
         it = self.items[i]
         tag = self._row_tag(i)
         y = i * pitch
@@ -1233,16 +1545,30 @@ class NiceList(tk.Canvas):
         #    之前把内容整段写进了 `elif i == self.hover:` 里，
         #    结果「既没选中也没悬停」的普通行什么都不画 —— 左栏只剩一排空背景块。
         if i == self.sel:
-            bg = self._rowbg(W - sc(2), "sel")
+            bg = self._rowbg(Wr - sc(2), "sel")
             self._refs.append(bg)
             self.create_image(sc(1), y, anchor="nw", image=bg, tags=tag)
         elif i == self.hover:
-            bg = self._rowbg(W - sc(2), "hover")
+            bg = self._rowbg(Wr - sc(2), "hover")
             self._refs.append(bg)
             self.create_image(sc(1), y, anchor="nw", image=bg, tags=tag)
         # ---- 文字/预览/徽章：每一行都要画 ----
         tx = pad + sc(2)
         ph = it.get("photo")
+        # ⚠️⚠️ **懒加载小预览**（v1.9）。`items[i]["photo"]` 为空但给了
+        #    `photo_fn` 时，**画到这一行才去取**。
+        #    配合虚拟化，一屏只要 ~9 张，而不是列表有多少项就要多少张。
+        #    实测「全部图片」400 项：填列表从 **1483ms** 降到十几毫秒
+        #    （每张缩略图 ~3.7ms，原来 400 张全在填列表时同步做）。
+        #    取回来的结果**写回 item**，所以重画同一行不会再取一次。
+        if ph is None:
+            fn = it.get("photo_fn")
+            if fn is not None:
+                try:
+                    ph = fn()
+                except Exception:
+                    ph = None
+                it["photo"] = ph
         if ph is not None:
             self._refs.append(ph)
             self.create_image(pad + sc(2), y + mid, anchor="w", image=ph,
@@ -1257,9 +1583,9 @@ class NiceList(tk.Canvas):
                    "strong": Palette.PRIMARY_D}.get(tone_b, Palette.TEXT_2)
             bimg, bw, bh = self._badge(badge, col, mix(col, "#ffffff", 0.86))
             self._refs.append(bimg)
-            self.create_image(W - pad - bw, y + mid - bh // 2,
+            self.create_image(Wr - pad - bw, y + mid - bh // 2,
                               anchor="nw", image=bimg, tags=tag)
-            self.create_text(W - pad - bw // 2, y + mid, text=badge,
+            self.create_text(Wr - pad - bw // 2, y + mid, text=badge,
                              fill=col, font=self.f_s, tags=tag)
             badge_w = bw + sc(10)
         tone = it.get("tone", "normal")
@@ -1269,13 +1595,15 @@ class NiceList(tk.Canvas):
         self.create_text(tx, y + mid - sc(9), text=it["title"],
                          anchor="w", fill=fg,
                          font=self.f_tb if i == self.sel else self.f_t,
-                         width=max(sc(40), W - tx - badge_w - pad),
+                         width=max(sc(40), Wr - tx - badge_w - pad),
                          tags=tag)
         sub = it.get("sub") or ""
         if sub:
             self.create_text(tx, y + mid + sc(9), text=sub,
                              anchor="w", fill=Palette.TEXT_3,
                              font=self.f_s,
-                             width=max(sc(40), W - tx - badge_w - pad),
+                             width=max(sc(40), Wr - tx - badge_w - pad),
                              tags=tag)
-        self.configure(scrollregion=(0, 0, W, len(self.items) * pitch))
+        # ⚠️ 这里**不再** `configure(scrollregion=...)`。
+        #    原来每画一行就设一次（400 行 = 400 次），纯浪费；
+        #    现在统一由 `_repaint()` 设一次。

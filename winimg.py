@@ -451,7 +451,20 @@ def _gdip_scale_argb(w, h, bgra, out_w, out_h):
     if bmp is None:
         return None
     try:
-        return _gdip_scale(bmp, out_w, out_h, interp, offset)
+        # ⚠️⚠️⚠️ **原来这里直接调 `_gdip_scale(bmp, out_w, out_h, interp, offset)`，
+        # 可`interp` 和 `offset` 这两个名字在本函数里**根本没定义**
+        # —— 走这条路必然抛 `NameError: name 'interp' is not defined`。
+        #
+        # 后果不是「某个角落功能坏掉」，而是**精确帧一走这条路就崩**：
+        # `image_scout._fit_async` 里 `need_gdip` 为真且 `interp is None`
+        # 的分支第一个撞上，异常被 `except` 吞掉 -> `ppm = None`
+        # -> `_fit_ready` 直接 return，**那一帧永远出不来**，
+        # 画面停在上一帧直到防抖也拿不到清晰帧。
+        #
+        # 是被探针 `probe_diag`（造「同源不同长宽比」的图）撞出来的 ——
+        # 造图和主程序两条路都指向这一个函数。
+        # 正确写法：显式给默认参数，语义不变（双三次 + 精确尺寸）。
+        return _gdip_scale(bmp, out_w, out_h, _INTERP_HQ_BICUBIC, _OFFSET_HQ)
     finally:
         gdiplus.GdipDisposeImage(bmp)
 
@@ -469,6 +482,22 @@ def _gdip_scale_argb2(w, h, bgra, out_w, out_h, interp=_INTERP_HQ_BICUBIC,
     if bmp is None:
         return None
     try:
+        # ⚠️⚠️⚠️ **这里必须传 `interp` / `offset`，不能硬编码**
+        #（v1.8 复核时发现）。
+        #
+        # 本函数**存在的意义就是「可指定插值模式」**（见 docstring 第一行）
+        # —— 硬编码成 `_INTERP_HQ_BICUBIC` 会让这两个参数变成摆设，
+        # 调用方传什么都没用。
+        #
+        # ⚠️ 怎么会变成这样：修 `_gdip_scale_argb` 那个真 `NameError`
+        #   时用了 `replace_all=true`，把**这个函数里本来合法的**
+        #   `interp, offset` 一起替换掉了。
+        #   ⇒ **改这类「两处长得几乎一样」的代码，绝不能用全局替换**；
+        #   必须带足上下文（函数签名 / docstring 首句）逐处替换，
+        #   然后回头 grep 一遍另一处有没有被误伤。
+        #     两个函数的区别就这一行：
+        #       `_gdip_scale_argb`  —— 无参数，用默认（双三次）
+        #       `_gdip_scale_argb2` —— 有参数，**必须透传**
         return _gdip_scale(bmp, out_w, out_h, interp, offset)
     finally:
         gdiplus.GdipDisposeImage(bmp)

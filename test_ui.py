@@ -137,6 +137,31 @@ def row_texts(lst, i):
     return out
 
 
+def text_gaps(lst):
+    """返回 `(缺字的行, 该画却没画的行)`。
+
+    ⚠️⚠️ 虚拟化（v1.9）之后**不能**再断言「每一项都有图元」——
+    屏幕外的行按设计就是不画的。但 2026-10-05 那条回归
+    （「既没选中也没悬停的行什么都不画，左栏只剩一排空背景块」）
+    必须仍然抓得住，所以拆成两条互补的判据：
+      · 缺字：**有图元**的行里，标题文字没出现的 —— 抓「画了背景却没画字」
+      · 漏画：**可见范围内**的行，一个图元都没有的 —— 抓「虚拟化忘了画」
+    原 bug 的两种形态都跑不掉：普通行 -> 零图元（落在「漏画」）；
+    选中行 -> 只有背景图元（落在「缺字」）。
+    """
+    i0, i1 = lst._vis
+    blank, missing = [], []
+    for i in range(len(lst.items)):
+        n = len(lst.find_withtag(lst._row_tag(i)))
+        if n == 0:
+            if i0 <= i < i1:
+                missing.append(i)
+            continue
+        if lst.items[i]["title"] not in " ".join(row_texts(lst, i)):
+            blank.append(i)
+    return blank, missing
+
+
 def shown_pct(cv):
     """图片在格子里占了多大（长边方向）—— 用来验「尽可能放大」。"""
     _, boxes = canvas_items(cv)
@@ -1392,17 +1417,19 @@ def main():
     # 只断言「画布上有 text 图元」会漏：选中行那一行照样能画出字。
     # 所以必须**逐行**断言：每一行都得有自己那张 title。
     for lst, nm in ((app.glist, "分组"), (app.mlist, "成员")):
-        blank = [i for i in range(len(lst.items))
-                 if lst.items[i]["title"] not in " ".join(row_texts(lst, i))]
+        blank, missing = text_gaps(lst)
         check(not blank,
-              "%s列表每一行都有文字（缺字的行：%s）"
+              "%s列表画出来的行都有文字（缺字的行：%s）"
               % (nm, blank[:6] or "无"))
+        check(not missing,
+              "%s列表可见范围内没有漏画的行（漏画：%s）"
+              % (nm, missing[:6] or "无"))
         kinds = set(lst.type(c) for c in lst.find_all())
         check("text" in kinds,
               "%s列表画布上有文字图元（实际类型 %s）" % (nm, sorted(kinds)))
-    # 每个「行标签」下的图元数应该 >1（背景 + 至少一行字）
+    # 每个「行标签」下的图元数应该 >1（背景 + 至少一行字）—— 只看画出来的行
     thin = [i for i in range(len(app.glist.items))
-            if len(app.glist.find_withtag(app.glist._row_tag(i))) < 2]
+            if len(app.glist.find_withtag(app.glist._row_tag(i))) == 1]
     check(not thin, "没有「只有背景没有字」的空行（%s）" % (thin[:6] or "无"))
 
     print("\n=== hover 局部重绘后文字还在 ===")
@@ -1412,10 +1439,11 @@ def main():
     for i in (0, 1, 2, 3):
         lst._motion(type("E", (), {"y": int(i * (lst.row_h + lst.gap)) + 4})())
     lst._leave()
-    after = [i for i in range(len(lst.items))
-             if lst.items[i]["title"] not in " ".join(row_texts(lst, i))]
+    after, still_missing = text_gaps(lst)
     check(not after, "划过若干行 + 移出列表后，文字仍然完整（缺字 %s）"
           % (after[:6] or "无"))
+    check(not still_missing, "划过之后可见范围仍然没有漏画（漏画 %s）"
+          % (still_missing[:6] or "无"))
 
     print("\n=== 左栏比例：分组大、成员小 ===")
     app.update_idletasks()

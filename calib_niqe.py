@@ -6,11 +6,12 @@
 
 ⚠️ **本文件需要 numpy + Pillow**（高斯模糊 / JPEG 编解码 / 分形噪声）。
    主程序 `image_scout.py`、`niqe.py` 以及五个 `test_*.py` **都不 import 它**，
-   项目「零第三方依赖」的性质不受影响。跑法：
+   项目「零第三方依赖」的性质不受影响。跑法（用**任意装了这两个库**的
+   Python 3 都行，不指定具体解释器路径）：
 
-       C:\\Users\\WQ\\.workbuddy\\binaries\\python\\envs\\default\\Scripts\\python.exe calib_niqe.py
+       python calib_niqe.py
 
-   （那个 venv 里有 numpy/Pillow；不想装就用不依赖第三方的那条对照 ——
+   （不想装就用不依赖第三方的那条对照 ——
     `test_niqe.py` 里的 `test_thresholds()` 用盒式模糊 + 均匀噪声，
     只靠标准库就能验「分数随劣化单调上升」和 8.0 这条门槛。）
 
