@@ -662,10 +662,26 @@ class App(tk.Tk):
         self.zoom = [1.0, 1.0]
         self.pan = [[0, 0], [0, 0]]
         self._drag = None
-        self._drag_last = 0.0     # 拖动时「上一次重取一块」的时刻（节流用）
+        # ⚠️⚠️ **不能用 `0.0` 当「还没重取过」的初值**（v1.7 修）。
+        # 判据是 `now - self._drag_last >= PAN_LAG`，而 `now` 是
+        # `time.time()`（秒级时间戳，1.7e9 量级）—— 于是
+        # `1.7e9 - 0.0 >= 0.02` **第一次拖动就恒真**，
+        # `PAN_LAG` 这个节流**从头到尾一次都没生效过**。
+        # 后果：拖动时每一步都重画（实测 59/60 步，每步 65~104ms
+        # = 丢掉 4~6 帧），这就是主人说的「拖拽有抖动」。
+        #
+        # 用 `None` 表达「还没重取过」，第一次无条件放行（对），
+        # 之后才真的按 PAN_LAG 限流。
+        self._drag_last = None        # 拖动时「上一次重取一块」的时刻（节流用）
+        # ⚠️ 「当前这一帧是不是拖动补块」—— `_render_tile` 据它决定缓冲用
+        #   厚还是薄（滚轮和拖动传的都是 `precise=0.75`，需求相反，
+        #   详见 `_render_tile` 里 `_pad_scale` 那段注释）。
+        self._pan_redraw_active = False
         self._prewarm_q = []
         self._prewarm_busy = False
         self._prewarm_pause = 0.0
+        # ⚠️ 拖动中攒下的预热字节（`_prewarm_done` 挂起的），松手再建 Tk 图
+        self._prewarm_hold = None
         self._base_busy = set()       # 正在后台解码的 (路径, 档位)
         self._base_prep_done = set()  # 解过（成功/失败都记，免得反复重试）
         self._base_want = {}          # 想要但还没动手的 (路径, 档位) -> 参数
@@ -716,6 +732,10 @@ class App(tk.Tk):
     def _build(self):
         root = tk.Frame(self, bg=P.PAGE)
         root.pack(fill="both", expand=True, padx=S(12), pady=S(10))
+        # ⚠️ 存一份（原来只有局部变量）：测试要拿它来验「快捷键绑在哪、
+        #    焦点让路」——`self` 是 Tkinter 的 Misc 子类，`focus_get`
+        #    在它上面能问，但造一个真拿到焦点的 Entry 需要 `Toplevel(root)`。
+        self._frame = root
 
         self._build_top(root)
 
@@ -726,6 +746,170 @@ class App(tk.Tk):
         self._fill_info()
 
         self.after(60, self._pump_queue)      # 队列泵只能由主线程启动
+        self._bind_keys(root)
+
+    # ---- 快捷键 --------------------------------------------------------
+    def _bind_keys(self, root):
+        """键盘快捷键（2026-10-06 主人加的）。
+
+        主人要的是「方向键或者 wasd 可以快捷换组、删除」。
+        绑定在**根窗口**而不是各个列表上，这样不管焦点在哪都能用 ——
+        用户点完图预览之后焦点通常不在列表上，绑在列表上等于没绑。
+
+        ⚠️⚠️ **必须在输入框获得焦点时让路**。没有这一步的话，
+        用户在「添加文件夹」那类 Entry 里按 Delete 想删字，结果把图删了 ——
+        这种误删要弹确认框都救不回来（用户会一路按 Yes）。
+        """
+        def on_key(ev):
+            # 焦点在输入类控件里 -> 只放行编辑键，其余一律不抢
+            w = self.focus_get()
+            if isinstance(w, (tk.Entry, tk.Text)) or \
+                    (w is not None and str(w).startswith("tkinter.Entry")):
+                return
+            k = (ev.keysym or "").lower()
+            ch = (ev.char or "").lower()
+            step = None
+            if k in ("up", "w"):
+                step = -1
+            elif k in ("down", "s"):
+                step = 1
+            elif k in ("left", "a"):
+                self._key_delete()
+                return
+            elif k in ("right", "d"):
+                self._key_delete(side=1)
+                return
+            elif k in ("delete", "backspace"):
+                self._key_delete()
+                return
+            elif k == "0":
+                self.reset_zoom()
+                self._toast("两侧都回到适应窗口")
+                return
+            elif ch in ("j",):
+                step = 1
+            elif ch in ("k",):
+                step = -1
+            if step is not None:
+                self._key_move(step)
+            return "break" if (step is not None or k in
+                               ("a", "d", "left", "right", "delete",
+                                "backspace", "0")) else None
+
+        try:
+            root.bind_all("<Key>", on_key)
+        except tk.TclError:
+            pass
+        # ⚠️ 挂成属性，测试才能**直接调它**验「焦点在输入框时让路」。
+        #    用 `event_generate("<Key>")` 派发是派发不到的（那是模拟真实
+        #    键盘输入，测试环境没有焦点链），第一版就靠「派发不到就直调
+        #    兜底」蒙过去 —— 那是假测：断言过了，但派发那条路根本没验证。
+        self._on_key = on_key
+
+    def _key_move(self, step):
+        """上下 / W S：切到上下一组（分组视图）或上下一张（全部图片视图）。
+
+        ⚠️ 两种视图语义不同：分组视图换的是「组」，全部图片视图没有组，
+        换的就是「张」。别混 —— 混了会出现「按 Down 什么都没发生」。
+        """
+        if self.view == "groups":
+            if not self.groups:
+                return
+            n = len(self.groups)
+            gi = (self.gidx + step) % n if self.gidx >= 0 else \
+                (0 if step > 0 else n - 1)
+            # ⚠️ `glist.select` 在「目标就是当前选中」时直接 return
+            #（它只重画旧行+新行）。首次按键时 `self.gidx` 可能是 0 而
+            #    列表 `sel` 还没同步，按 Down 就**没反应**。
+            #    `_sync_list_sel` 统一处理（两个视图都要，别只改一处）。
+            self._sync_list_sel(gi)
+            self.select_group(gi)
+            self._toast("第 %d / %d 组" % (gi + 1, n))
+        else:
+            # ⚠️⚠️⚠️ **必须按「列表顺序」走，不能按 `self.files` 的顺序**
+            #（v1.7 修，主人会真按的）。
+            #
+            # `_fill_all_list` 把列表**按质量重排**了
+            #（`QUALITY_RANK` + 文件名），所以 `glist.items` 的顺序
+            # 跟 `self.files` **不一样**。实测 59 张图里：
+            #     列表第 0 行 = ...\00_wave\crop_16_9.png -> files 下标 1
+            #     files[0]    = ...\低清小图.png
+            # 我原来用 `files.index(path_a)` 算下标，于是「按 ↓ 换到下一张」
+            # 换的是**列表里看不见的那一张** —— 用户连按几下，屏幕上的行
+            # 和右边显示的图对不上，看起来就是「按键坏了」。
+            #
+            # 现在直接读列表：用户看到什么顺序，按键就走什么顺序。
+            order = [it["tag"] for it in (getattr(self.glist, "items", None)
+                                          or [])]
+            if not order:
+                order = list(self.files or [])
+            if not order:
+                return
+            cur = self.path_a
+            try:
+                i = order.index(cur)
+            except ValueError:
+                # 当前图不在列表里（刚被删 / 列表重排过）-> 从头/从尾开始
+                i = -1
+            j = (i + step) % len(order) if i >= 0 else \
+                (0 if step > 0 else len(order) - 1)
+            # ⚠️ `glist.select` 在「目标就是当前选中」时直接 return（只重画
+            # 旧行+新行），首次按键时列表 `sel` 还没跟 `path_a` 同步，
+            # 按 Down 会**没反应**。`_sync_list_sel` 统一处理。
+            self._sync_list_sel(j)
+            self._show_all_item(order[j])
+
+    def _sync_list_sel(self, idx):
+        """把分组/图片列表的选中态对齐到第 `idx` 行（越界就不动）。
+
+        ⚠️ `glist.select()` 在「目标就是当前选中」时直接 return（只重画
+        旧行+新行），所以首次按键时 `gidx`/`path_a` 跟列表 `sel` 可能不一致，
+        按 Down 就**没反应**。这里先调 `select` 让它自己走正常的通知流程，
+        不一致时再兜底直接设 `sel` 并重画那两行。
+        """
+        items = getattr(self.glist, "items", None) or []
+        if not (0 <= idx < len(items)):
+            return
+        try:
+            self.glist.select(idx, notify=True)
+        except TypeError:
+            # 老签名没有 notify 参数
+            try:
+                self.glist.select(idx)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        if getattr(self.glist, "sel", None) != idx:
+            try:
+                self.glist.sel = idx
+                self.glist._redraw_rows([idx])
+            except Exception:
+                pass
+
+    def _key_delete(self, side=0):
+        """Delete / A / D / Backspace：删掉当前这一侧的图（走既有确认框）。
+
+        ⚠️ 复用 `delete_side`，不要另写一套 —— 它才有那个
+        「是移动不是删除、隔离位置在哪」的确认框，以及删完之后
+        的列表/统计/结论的整套重算。
+
+        ⚠️⚠️ **单图模式下按 `D`（删右侧）不能静默改成删左侧**。
+        原来 `col = side if (mode == "pair" and side == 1) else 0` 一把
+        把 side 吞掉 —— 单图模式下根本没有右侧，按 `D` 却在删**当前
+        正在看的那张**。用户以为「删右边」，实际删的是眼前这张：这是
+        误删，而误删只有确认框挡着（用户赶时间会一路按 Yes）。
+        改成说清楚「现在只有一张，删的是它」。
+        """
+        pair = (self.mode == "pair" and bool(self.path_b))
+        if side == 1 and not pair:
+            self._toast("现在只有一张图 —— 删的是正在看的这张")
+            self._toast("（想换另一张：按 ↑↓ 或 W S）")
+            side = 0
+        if not self.path_a:
+            self._toast("还没有图可删")
+            return
+        self.delete_side(0 if side == 0 else 1)
 
     # ---- 顶栏 ----------------------------------------------------------
     def _build_top(self, root):
@@ -1025,7 +1209,7 @@ class App(tk.Tk):
         self.cur_member = None
         self.path_a = self.path_b = None
         self._drag = None
-        self._drag_last = 0.0
+        self._drag_last = None      # 同 __init__：None = 还没重取过（见那段）
         self._prewarm_q = []
         self._prewarm_busy = False
         self._base_busy = set()
@@ -1152,6 +1336,22 @@ class App(tk.Tk):
         self._q.put((fn, a))
 
     def _pump_queue(self):
+        # ⚠️⚠️ **正在拖动就整个让路**（v1.7 修拖动卡顿的最后一块）。
+        #
+        # 这里跑的是**主线程**任务：后台解码好的 PPM 在这儿变成 PhotoImage，
+        # 一次 50~150ms（实测拖动时 p95 稳定在 95~109ms、max 200ms，
+        # 连跑三次复现）。而它每 60ms 就来一次 —— 正好撞在拖动帧上，
+        # 用户看到的就是「拖一下卡一下」。
+        #
+        # ⚠️ 判据要先自证这不是「补块慢」：把 `_pan_move` 的补块判据强制
+        #   打开（每步都补）后，p95 仍是 95~109ms，而补块次数从 12涨到 33
+        #   —— **慢与补块次数无关**，只能是这条队列。
+        #
+        # 让路是安全的：队列不丢，`after` 照常重新排，拖动一松手就补上。
+        # 而且这时画面本来就是「拖动中」，用户看的不是高清帧。
+        if self._drag:
+            self.after(60, self._pump_queue)
+            return
         try:
             while True:
                 fn, a = self._q.get_nowait()
@@ -1584,6 +1784,15 @@ class App(tk.Tk):
         self.pair = None
         self.rect_a = self.rect_b = None
         self.pan = [[0, 0], [0, 0]]
+        # ⚠️⚠️ **换图必须把缩放也归位**（主人 2026-10-06 报「换组不会
+        # 自动重置放缩」）。原来这里只清了 `pan`、没清 `zoom` ——
+        # 于是上一组放大到 400% 时切到下一组，那张图也还是 400%，
+        # 而它的显示图可能根本没那么大（`disp` 比视口还小），
+        # 结果就是「一片糊/一片空白，看着像坏了」。
+        # 换图 = 换了个内容，缩放状态不该继承 —— 这跟「切窗口要复位」
+        # 是一回事。`reset_zoom` 里那两个 `_toast` 提示在这里会吵，
+        # 所以直接归位、不提示（用户是主动换图的，不算意外）。
+        self.zoom = [1.0, 1.0]
         if a and b and a in descs and b in descs:
             try:
                 self.pair = scan.compare_pair(
@@ -1644,8 +1853,27 @@ class App(tk.Tk):
         z = max(ZOOM_MIN, min(ZOOM_MAX, cur * step))
         if abs(z - cur) < 1e-6:
             return
+        # ⚠️⚠️ **以鼠标底下那一点为锚点缩放，别把它送回画面中间**。
+        #
+        # 原来这里是 `self.pan[col] = [0, 0]` —— 一滚就把平移清零，
+        # 于是「拖到某个位置再放大」会**跳回中间**（主人 2026-10-06 报的）。
+        # 那不是「缩放该有的行为」，是根本没实现锚点：清零等于宣告
+        # 「缩放后重新居中」，可用户明明还没挪回去。
+        #
+        # 锚点缩放的算式。图元画在 `ox + vx0`（`vx0` 是「显示图」坐标），
+        # 其中 `ox = (cw - disp_w)//2 + pan`，而 `disp_w ∝ zoom`。于是
+        # 「鼠标底下那点」的**基准像素**坐标是
+        #     p = (mx - ox) * bw/disp_w = (mx - ox) / (fit*zoom)
+        # 缩放比例 z/cur，要让它缩放前后不动：
+        #     (mx - ox') / z  ==  (mx - ox) / cur
+        # 解得   pan' = mx - (cw - disp_w*z/cur)//2 - z*(mx-ox)/cur
+        # ⚠️⚠️ **两处都是除以 zoom**（`(mx-ox)/cur` 和 `disp_w*z/cur`）。
+        #    我第一版两处都写成乘法，连滚 6 格把平移推到 129 万像素 ——
+        #    详见方法体里那段记录。
+        keep = self._zoom_anchor(col, ev.x, ev.y, cur, z)
         self.zoom[col] = z
-        self.pan[col] = [0, 0]        # 只清这一侧的平移
+        if keep is not None:
+            self.pan[col] = [keep[0], keep[1]]
         self._prewarm_yield()         # 正在缩放：预热别来抢 GIL
         # 先用缓存里已有的图立刻响应（绝不同步重解大图 —— 那是「缩放好卡」
         # 的根源），再防抖 170ms 按新 zoom 精确重解一帧。连滚 N 格只解一次。
@@ -1653,11 +1881,81 @@ class App(tk.Tk):
         #    0.75 欠采样 1.33 倍（看不出糊），而正在看的那两张在预热里已经
         #    备满了档，这里几乎都是缓存命中，代价一样是几毫秒。
         self.render_all(precise=0.75, only=col)
-        self._later("zoomhi%d" % col, 170,
-                    lambda c=col: self.render_all(precise=True, only=c))
+        # ⚠️⚠️ **防抖到期的那一帧，拖动中必须跳过**（v1.7 修帧间隔 185ms）。
+        #
+        # 埋点抓到：滚轮防抖留的 `zoomhi` 回调是 `precise=True` 精确重画
+        # （实测单次 **69~74ms**），而它**不看 `_drag`** —— 用户滚完轮
+        # 立刻开始拖，那一帧就会在拖动中途炸出来。AFTERDBG 统计里它是
+        # 拖动期间仅次于 `_pan_fill` 的耗时源（每方向 2 次 × 73ms）。
+        #
+        # 跳过是安全的：拖动中每一步都在按 0.75 补块，松手时 `_pan_end`
+        # 会用 `precise=True` 补最终帧 —— 清晰度一秒都不亏。
+        def _zoom_hi(c=col):
+            if self._drag:
+                return
+            self.render_all(precise=True, only=c)
+        self._later("zoomhi%d" % col, 170, _zoom_hi)
         self._toast("%s缩放 %.0f%%（滚轮调整，按住可拖动）"
                     % ("" if self.mode != "pair" else ("左" if col == 0 else "右"),
                        z * 100))
+
+    def _zoom_anchor(self, col, mx, my, cur, z):
+        """算「以鼠标底下那点为锚点」缩放后该有的平移量，返回 `(pan_x, pan_y)`。
+
+        ⚠️ 为什么必须有这个（主人 2026-10-06 报「拖到一个位置想放大，
+        它会重新回到画面中间」）：图元画在 `ox + vx0`（`vx0` 是**显示图**
+        坐标），其中 `ox = (cw - disp_w)//2 + pan`。要让鼠标底下那点
+        （画布坐标 `(mx, my)`）缩放前后**停在同一块像素上**，就得满足
+
+            (mx - ox') / z  ==  (mx - ox) / cur
+
+        （两边都是「画布偏移 ÷ 该级的 zoom」= 该点的**基准像素**坐标，
+        相等就说明盯着的是同一块像素）。解出
+
+            pan' = mx - (cw - disp_w*z/cur)//2 - z * (mx - ox)/cur
+
+        ⚠️ 注意两处都是**除以 zoom**：`disp_w` 随 zoom 线性变化，所以
+        新显示尺寸是 `disp_w*z/cur`，不是 `disp_w*z`。
+
+        ⚠️ 返回 `None` 表示**这次不算锚点**（拿不到画布尺寸/显示图尺寸），
+        调用方要沿用旧平移，而不是清零 —— 清零就是「跳回中间」，
+        正是要修的那个毛病。
+        """
+        cv = self.cv_a if col == 0 else self.cv_b
+        if self.mode != "pair":
+            cv = self.cv_a
+        if cv is None:
+            return None
+        cw = max(1, cv.winfo_width())
+        ch = max(1, cv.winfo_height())
+        info = self._view.get(col) or {}
+        disp = info.get("disp")
+        if not disp or disp[0] <= 0 or disp[1] <= 0:
+            return None
+        dw, dh = disp
+        # ⚠️⚠️⚠️ **`dw/dh` 是「当前 zoom 下」的显示尺寸**，不是原图尺寸。
+        #    新 zoom 下的显示尺寸要按 `z/cur` 换算 —— 直接 `dw*z` 是错的
+        #    （见下面「我第一版写错了」的记录）。
+        ndw = max(1, int(round(dw * z / cur)))
+        ndh = max(1, int(round(dh * z / cur)))
+        # 缩放前：鼠标点在画布上的偏移（相对显示图左缘）
+        ox = (cw - dw) // 2 + self.pan[col][0]
+        oy = (ch - dh) // 2 + self.pan[col][1]
+        # ⚠️⚠️⚠️ **不变量必须除以 zoom，不是乘**（我第一版写反了）。
+        #
+        # 图元画在 `ox + vx0`（显示坐标），而显示坐标 `vx` 对应的基准像素是
+        #     `p = vx * bw/disp_w = vx / (fit*zoom)`
+        # 所以缩放不变量是 **`(mx - ox) / zoom`**，不是 `(mx - ox) * zoom`。
+        # 写成乘法的话每滚一格误差乘 `cur²`，连滚 6 格放大 2000 多倍 ——
+        # 实测平移量被推到 **129 万像素**（视口才 1515 宽），整块图飞到天边，
+        # 块尺寸也塌成 `blk=(8,8)`，拖动全程在空白里挪。
+        px = (mx - ox) / cur
+        py = (my - oy) / cur
+        # 缩放后：让同一点仍落在 (mx, my)
+        nox = (cw - ndw) // 2
+        noy = (ch - ndh) // 2
+        return (int(round(mx - nox - px * z)),
+                int(round(my - noy - py * z)))
 
     def reset_zoom(self):
         """两侧一起回到「适应窗口」。
@@ -1684,31 +1982,445 @@ class App(tk.Tk):
         精确的（`_pan_end`）。平时在缓冲内移动仍然是纯挪图元，零成本。
         """
         d = self._drag
-        if not d or d[0] != col or self.zoom[col] <= 1.001:
+        # ⚠️⚠️⚠️ **不能因为「没放大」就整个冻结拖动**
+        #（主人 2026-10-06：「缩放时会强制定位到图片中心」+
+        #  「在拖动前必须进行缩放，不然无法拖拽」）。
+        #
+        # 原来这里直接 `return`：`zoom <= 1.001` 时**整个拖动被冻结**。
+        # 而 `zoom=1` 是「适应窗口」—— 此时缩回 1.0，画面立刻回到居中、
+        # 再也拖不动。用户看到的就是「一缩放就被甩回中间」。
+        #
+        # 现在改成：**任何情况下都不在入口冻结**，一律交给下面的夹持
+        # （`lo/hi` 取 min/max，区间宽度恒为 `|cw-dw|`）。
+        # 夹持会自动做到「拖得动，但不把图拖出视口」。
+        if not d or d[0] != col:
             return
         info = self._view.get(col)
         if not info:
             return
+        disp = info.get("disp") or (0, 0)
+        cv = info["cv"]
+        cw = max(1, cv.winfo_width())
+        ch = max(1, cv.winfo_height())
+        # ⚠️⚠️⚠️ **不许在这里 return**（v1.7 修「图比视口小时完全拖不动」，
+        # 主人 2026-10-07：「每次拖拽前必须缩放一下，在这个位置无法拖拽」
+        # + 截图显示 36%）。
+        #
+        # 原来这四行是「图比视口小就直接不动」：
+        #     _room_x = disp[0] - cw
+        #     _room_y = disp[1] - ch
+        #     if _room_x <= 0 and _room_y <= 0:
+        #         return
+        #
+        # ⚠️⚠️ **它的想法是错的**：把「图完全塞得下」当成了「拖了没意义」。
+        # 可图比视口小时恰恰**最能拖** —— 整张图都在画布里，
+        # 往任意方向挪都不会切掉内容，这正是「拖着看整图」最自然的交互。
+        # 实测主人那个位置：图 477x736、视口 1515x757，
+        # **横向本该有 1038px 可拖范围**（69% 视口宽），却被冻成 pan=0。
+        #
+        # 真正「拖不动」的只有一种情况：`dw == cw` 且 `dh == ch`
+        # （图正好铺满视口，一个像素都挪不动）。那种情况**下面的夹持
+        # 会自动处理**（区间宽度 `|cw-dw|` = 0，夹完还是 0），
+        # 不需要在入口处特判 —— 入口特判反而漏掉了「一维刚好铺满、
+        # 另一维有余量」这种常见情形。
         px = d[3] + (ev.x - d[1])
         py = d[4] + (ev.y - d[2])
-        cv = info["cv"]
-        cv.coords(info["item"], info["ox"] + (px - info["px"]),
-                  info["oy"] + (py - info["py"]))
+        # ⚠️⚠️ **把平移量夹在「图能移动的范围」内**，两维分别算。
+        #
+        # 图在画布上的范围 = `[ox, ox+dw]`，`ox = (cw-dw)//2 + pan`。
+        # 「图边最多比视口边多出 T 像素」解出：
+        #     pan >= -T - (cw-dw)//2
+        #     pan <=  cw + T - dw - (cw-dw)//2
+        # ⚠️⚠️ **两个界限不对称**（`(cw-dw)//2` 本身可能是负数）。
+        #   我第一版图省事写成 `±(dw-cw)//2`，在 dw 略大于 cw 时
+        #   上下限差不多对，但**实测 y 方向仍露了 293px** ——
+        #   因为图高 1050 / 视口 757，`(757-1050)//2 = -147`，
+        #   正确区间是 `[147, -146]`（**空的**，见下），而 `±147` 超出了。
+        #
+        # ⚠️⚠️⚠️ **图比视口大时，「零露白」在数学上就不可能**：
+        #   区间宽度 = `cw - dw` = **负数**。也就是说无论怎么拖，
+        #   都至少有一边露 `dw-cw` 像素 —— 那是**图比视口多出来的部分**，
+        #   是图的固有属性，不是拖坏的。
+        #   所以这里的 T 就是「允许拖出视口多少」：图大时按 T=0 夹
+        #   （拖到图边对齐视口边为止，最自然），图小时 T 也=0
+        #   （不许拖出）。**两维独立**，一维有余量另一维没余量都常见。
+        _T = 0
+        # ⚠️⚠️⚠️ **区间公式：lo/hi 谁大谁小必须先推对**（v1.7 踩了整整三轮）。
+        #
+        # 图在画布上的范围 `[ox, ox+dw]`，`ox = (cw-dw)//2 + pan`。
+        # 「零露白」= `ox <= 0`（图左沿不越过视口左沿）
+        #           且 `ox + dw >= cw`（图右沿不短于视口右沿）。解出：
+        #     pan <= -(cw-dw)//2                       = 上界
+        #     pan >=  cw - dw - (cw-dw)//2              = 下界
+        # 于是区间宽度 = `dw - cw`：**图比视口大时是正的**（可以拖），
+        # 图比视口小时是负的（区间为空= 塞得下，拖了必然露白）。
+        #
+        # ⚠️ 我头一版把这两条写反了（`lo = -_cx`、`hi = cw-dw-_cx`），
+        # 于是**无论图大图小，`lo` 都大于 `hi`**：
+        #   实测 3.81 档 `_cx = -1348` -> `lo=1348, hi=-1348`，
+        #   被我当「空区间」处理、取并集钉死在 `pan=1348` —— 而日志里
+        #   `pan=(1348,1026)` **恰好就是这个数**，一下就暴露了公式反了。
+        #   危害是 60 步全被吸回同一点，画面覆盖卡 0% / 58%。
+        _cx = (cw - disp[0]) // 2
+        _cy = (ch - disp[1]) // 2
+        # ⚠️⚠️⚠️ **lo/hi 必须取 min/max，方向随「图比视口大还是小」翻转**
+        #（v1.7 修「图比视口小时完全拖不动」，主人 2026-10-07 报：
+        #  「每次拖拽前必须缩放一下，在这个位置无法拖拽」+ 截图 36%）。
+        #
+        # 这和 v1.7 那次「lo/hi 写反」是**同一类错误的第二次** —— 两次都是
+        # 没把「两个候选界的大小关系会翻转」这件事想清楚。
+        #
+        # 推导（记 `m = (cw-dw)//2`，图在画布上 `ox = m + pan`）：
+        #   `dw <= cw`（图比视口小）-> 要「图**完整可见**」
+        #       ox >= 0      =>  pan >= -m
+        #       ox + dw <=cw =>  pan <=  cw - dw - m
+        #     => 区间 `[-m, cw-dw-m]`，宽度 `cw-dw`
+        #   `dw >  cw`（图比视口大）-> 要「画面**无空白**」（图盖住视口）
+        #       ox <= 0     =>  pan <= -m
+        #       ox + dw >= cw => pan >=  cw - dw - m
+        #     => 区间 `[cw-dw-m, -m]`，宽度 `dw-cw`
+        #
+        # ⚠️⚠️ **两行的界是同样的两个数 `-m` 和 `cw-dw-m`，只是大小关系相反。**
+        # 所以正确写法只有一行 —— 取 min/max，不必分情况：
+        #     lo, hi = min(-m, cw-dw-m), max(-m, cw-dw-m)
+        #
+        # 我原来只实现了第二种（且用 `lo <= hi` 判「能不能拖」），
+        # 于是**图比视口小时区间恒空 -> 被判成「图塞得下、拖了只会露白」
+        # -> 整个拖动被冻结**。实测主人那个位置：图 477x736、视口 1515x757，
+        # 横向本该有 **1038px** 的可拖范围（69% 视口宽），实测 pan 恒为 0。
+        #
+        # ✅ 附带好处：**「真空间隙」根本不存在**。
+        #   `hi - lo = |cw - dw|`，只有 `dw == cw`（正好铺满）时才是 0。
+        #   所以下面那个 `if not free_x: px = 中点` 的分支是多余的 ——
+        #   它是「用错一套界」的产物，留着只会让人以为空区间是合法状态。
+        lo_x, hi_x = min(-_T - _cx, cw + _T - disp[0] - _cx), \
+            max(-_T - _cx, cw + _T - disp[0] - _cx)
+        lo_y, hi_y = min(-_T - _cy, ch + _T - disp[1] - _cy), \
+            max(-_T - _cy, ch + _T - disp[1] - _cy)
+        # 逐维夹住：图比视口小的那一维，区间就是「让它贴边但不越界」；
+        # 图比视口大的那一维，区间是「不露白」。两维互不干扰。
+        px = max(lo_x, min(hi_x, px))
+        py = max(lo_y, min(hi_y, py))
+        # ⚠️⚠️ **必须用 `bx/by`（图元自己的落点），不能用 `ox/oy`**。
+        #
+        # `ox/oy` 是**整张显示图的原点**，而分块之后贴上画布的只是
+        # 视口 + 缓冲那一小块，它贴在 `ox + px0/sx`（实测 pan=0 时
+        # ox=-1348、图元实际在 -151）。拿 `ox` 当落点 = 每一步都把图元
+        # 瞬移回显示图左上角，露出 1044px 空白 -> 判定「该重画」->
+        # 每步 60~90ms —— **这就是主人说的「拖拽有抖动」**。
+        # 整张贴图那条路径 `bx == ox`，所以两边写法统一没有副作用。
+        cv.coords(info["item"], info.get("bx", info["ox"]) + (px - info["px"]),
+                  info.get("by", info["oy"]) + (py - info["py"]))
         self.pan[col][0], self.pan[col][1] = px, py
-        # ⚠️⚠️ **露白（缓冲吃光）必须立刻重画，不能等节流**。
-        #    节流是 80ms 一次，而快速拖动 80ms 内能挪 300px+ —— 缓冲只有
-        #    15%（约 150px），等节流的那一帧画面已经空了。实测 40 步拖动
-        #    里 36 步盖不满，最少只盖到 69%，就是这里。
-        #    代价：重画一次 0.6~1.8ms（缓存命中），远比露白难看得多；
-        #    真要更省，可以只在「露白超过一定面积」时才重画。
-        need = self._tile_needs_more(col, cv, px, py)
-        now = time.time()
-        if need and now - self._drag_last >= self.PAN_LAG:
-            self._drag_last = now
-            # ⚠️ 用 **0.75 中间档**，别用 `precise=False`：粗档只有一半分辨率，
-            #    拖动全程都是 2~6 倍欠采样 —— 主人反馈「推拽还有马赛克」就是
-            #    这里。0.75 欠采样 1.33 倍（看不出糊），块像素只有精确档的 56%。
+        # ⚠️⚠️ **真正的判据是「离露白还有多远」**，不是「盖没盖满」。
+        #
+        # v1.6 的 `_tile_needs_more` 判的是「bbox 盖不满画布就重画」，
+        # 而它配的节流又因为 `_drag_last = 0.0` **一次都没生效过**
+        #（`time.time() - 0.0 >= 0.02` 恒真）。两层一起失效 =
+        # 拖动时**每一步都重画**：实测 60 步里 60 步、每步 65~94ms
+        #（16ms 一帧 = 掉 4~6 帧），这就是主人说的「拖拽有抖动」。
+        #
+        # 只把节流修好也不行：「盖不满」那一刻画面**已经露白了**。
+        # 块是「视口 + 一圈约 152px 缓冲」，挪 8px 就吃掉 8px 余量，
+        # 等余量归零，前面的帧早就在白跑重画了。
+        #
+        # 所以判据换成 `left`：缓冲还剩厚厚一层（>= PAN_REDRAW_PX）就
+        # **别重画** —— 挪 8px 不可能露白。重画频率从「每步」降到
+        # 「每 PAN_REDRAW_PX / 步长」步一次。
+        # ⚠️⚠️ **逐维判「这一维还有没有富余」**，而不是整体 `_at_limit`。
+        #
+        # 踩过的两个坑（都是判据的错）：
+        #   ① `or`：任一维到极限就不补块 -> 另一维真露白也不补，
+        #      实测「画面盖满画布最差 0%」。
+        #   ② `and`：两维都到极限才算贴边 -> 只到一维时另一维真露白，
+        #      同样漏补（换个姿势犯同一个错）。
+        #
+        # 正确口径：**只有「slack 为负的那一维」真的没富余了才不用补**。
+        # 有富余的维度不管到没到极限，露白都还能靠补块解决。
+        left = self._tile_slack(col, cv)
+        # ⚠️⚠️⚠️ **「到头了就不用补块」= 区间宽度耗尽**（v1.7 第三版，
+        # v1.7 收尾再修一次口径）。
+        #
+        # 修好 lo/hi 方向之后（见上面那段推导），`hi - lo` 恒等于
+        # `|cw - dw|`，**再也不会是负数**了 —— 之前那些「负数导致
+        # `_no_room` 恒真」的 troubles 一并不存在了。现在它就是字面意思：
+        # **这一维还能再拖多少像素**。
+        #
+        #   - 宽度 > 2 -> 还能拖 -> 拖的过程中可能露白 -> **要补块**
+        #   - 宽度 <= 2 -> 已经拖到头（`dw==cw` 正好铺满，或贴到边），
+        #     再拖也是原地；此时 slack 若不足，那是**图的边**够不到，
+        #     补块也补不出来 -> **不用补**
+        #
+        # 逐维判：任一维还能动，那一维就可能露白，得补。
+        _room_x_left = hi_x - lo_x
+        _room_y_left = hi_y - lo_y
+        _no_room = (_room_x_left <= 2 and _room_y_left <= 2)
+        # ⚠️⚠️⚠️ **贴边死循环：pan 已经不动了，就不该再补块**（v1.7）。
+        #
+        # 探针抓到：拖到图边缘后最后 25 步 **pan 完全不变**（被夹住），
+        # 可图元**每一步都换**（`.........1...........1111111111111111111111111`）
+        # -> 每步一次 `delete + create_image` + Tk blit，**实测 p95 120ms**。
+        # 原因是我上一版把「图比视口大」判成「有无限空间」（那时的
+        # `free=True` 口径），于是 `_no_room` 恒假 —— 可「空间无限」
+        # 说的是**拖动**，拖不动的时候照样不该重画。
+        #
+        # ⚠️ 那个 `free_*` 口径本身已经被上面 lo/hi 的修复淘汰了
+        #   （`hi - lo = |cw-dw|` 直接就是真实余量，不需要间接推断）。
+        #   但这条判据依然必要 —— 「区间还有余量」和「这一步真的动了」
+        #   是两件事：区间宽 1038px 但鼠标停在原地不动时，同样不该重画。
+        #
+        # 正确判据：**这一步 pan 相对上一帧真的动了吗**。
+        # 没动 = 已经贴边，画面不会变化，重画纯属白花 100ms。
+        _prev = info.get("px"), info.get("py")
+        _moved = (px != _prev[0]) or (py != _prev[1])
+        # ⚠️⚠️⚠️ **判据必须是「有没有跨出当前块」，不是「离边缘多远」**
+        #（v1.7，配合「块长恒定」这个前提）。
+        #
+        # 块长定长之后，slack 里**横向那一维恒定不变**（块比视口宽固定的
+        # 那一截），纵向也在变 —— 但 `min(四边)` 会被恒定的那维顶住，
+        # 于是 slack 看着还有 42、纵向其实早露白了。trace 实测补块间隔
+        # 正好等于网格步长（56px = 8 步），比该有的多 4~5 倍。
+        #
+        # 正确判据直接对齐机制：**当前视口还落在已渲染那一块里吗**。
+        # 块起点是 `bx/by`、块显示尺寸可由 `_view["want"]` 与基准比例
+        # 反推；更省事的等价写法是**比较网格坐标** ——
+        # `_render_tile` 用 `floor((-o - pad) / pad)` 定网格，
+        # 这里用同一个式子，两边永远一致。
+        _pad = info.get("pad") or (max(8, int(min(disp[0], cw) * self.TILE_PAD)),
+                                   max(8, int(min(disp[1], ch) * self.TILE_PAD)))
+        # ⚠️ **两维各用自己的 pad**：横向 pad 和纵向 pad 不同（视口宽高不同），
+        #   网格步长也不同，必须分开算 —— 我第一版拿一个标量两边共用，
+        #   结果纵向判错格、补块从 12涨到 41。
+        _padx = max(8.0, float(_pad[0]))
+        _pady = max(8.0, float(_pad[1]))
+        # ⚠️ 用**这一帧记录的显示图原点**，而不是当前算的 ——
+        #   `ox/oy` 是渲染那帧算的（含当时的 pan），`_pan_move` 里
+        #   没有自己的 ox/oy（我第一版直接写 `ox`，NameError）。
+        _vox = info.get("ox", 0)
+        _voy = info.get("oy", 0)
+        # ⚠️⚠️ **必须先把 pan 的增量算进去**（v1.7）：
+        #   网格是**渲染那帧**的 ox 算出来的，而 `info["ox"]` 是**上一帧**
+        #   的 —— 两者差一个本步的 pan 增量。漏掉这一步判据会整体偏一格
+        #   ->「提前一格补块」（实测补块从 12 涨到 41 就是这个）。
+        _vox -= (px - _prev[0])
+        _voy -= (py - _prev[1])
+        # ⚠️⚠️ **索引也必须夹到 0，与 `_render_tile` 的 `vx0 = max(0, _gridx)`
+        # 完全一致**（v1.7 修露白）。拖到图顶/图左时 `_gridx` 是负数、
+        # 被 `max(0, ...)` 夹成了 0 —— 可索引还留着那个负数，于是
+        # 「当前格」永远算不对 -> 判该补时不补 -> **画面露白 11~12%**。
+        # 一处夹一处不夹，两边就永远对不上。
+        _gx = int((-_vox - _padx) // _padx)
+        _gy = int((-_voy - _pady) // _pady)
+        # 夹到 0 之后再乘回去，就是 `_render_tile` 里那个网格起点
+        _g = (max(0, _gx), max(0, _gy))
+        _g0 = info.get("grid")
+        # ⚠️⚠️ **判据只能看横向网格**（v1.7，配合「横向定长、纵向跟视口」）。
+        #
+        # 横向块长恒定、起点由网格定=> 横向跨格就是缓存 key 变了，
+        # **必须补**。
+        # 纵向块长跟着视口走=> 纵向跨格时key **本来就该变**（不是失效），
+        # 可那一帧图元还是旧块的（纵向滑动的代价），所以纵向要靠 slack
+        # 判「真的快露白了就补」。我第一版把两维都用网格判，
+        # 结果「上」方向补块从 8涨到 16 —— 纵向网格一格121px、
+        # 而纵向缓冲只剩~48px，等不到那一格就先露白了。
+        _crossed = (_g0 is None) or (_g[0] != _g0[0])
+        if not _no_room and _moved and (_crossed or left < 1) and \
+                left < self._pan_redraw_px(disp[0], disp[1], cw, ch):
+            self._drag_last = time.time()
+            # ⚠️⚠️⚠️ **补块必须挪到「下一轮事件循环」，不能在这一帧里做**
+            #（v1.7 修「最慢一帧 164~204ms」）。
+            #
+            # 埋点抓到：补块那一帧的`render_all` 本身要 108~113ms
+            #（真编码一整块），加上 Tk blit 就是 160~200ms —— 一帧丢掉
+            # 10~12 帧，用户看到的是「拖一下停一下」。
+            #
+            # 为什么挪走是安全的：**这一帧该做的已经做完了** ——
+            # 图元已按新 pan 挪好（跟手比值恒-1）、判据也判过了。
+            # 块只是「下几帧才用得上」的缓存，现在补和 16ms 后补
+            # 在画面上**完全一样**（人眼分辨不出 16ms）。
+            # 而且拖动越快、块越早被复用 —— 但那时早就补好了。
+            #
+            # `after(1)` 而不是 `after(0)`：给 Tk 一个真实的下一轮，
+            # 保证这一帧的 update() 能先把挪好的图元blit 出去。
+            #
+            # ⚠️ 用**固定 key**（去抖）：拖动中会连发几十次「该补块」，
+            #   不去抖就变成排几十个回调，一次性全跑完反而更卡。
+            self._pan_fill_pend = True
+            if not self._later_ids.get("panfill"):
+                self._later_ids["panfill"] = self.after(1, self._pan_fill)
+        return
+
+    def _pan_fill(self):
+        """拖动补块（延迟到下一轮事件循环，见 `_pan_move` 那段注释）。
+
+        ⚠️⚠️⚠️ **同步补块依然是 108~113ms，主线程躲不掉**（v1.7 实测）。
+        #
+        # `after(1)` 只是把它推到下一次 `update()`，可下一次 `update()`
+        # 同样会等它跑完 —— 用户看到的还是「拖一下停一下」（实测最慢单帧
+        # 186~196ms）。
+        #
+        # ✅ 所以拖动补块**必须上后台线程**。好在设施是现成的：
+        # `_fit_async` 已经在做「后台 GDI+ + 编码 -> `_fit_ready` 换图元」，
+        # 拖动补块只要把 `precise` 那一档也丢过去就行。
+        # 主线程这一帧就只挪图元（0~2ms），**彻底不卡**。
+        #
+        # ⚠️ 为什么滚轮/精确帧不这么做：它们要「立刻看到结果」
+        #（滚轮要在170ms 内给清晰帧），后台化会让手感变差。
+        # 拖动补块是「下一帧才用得上」的缓存，后台化零代价。
+        #
+        # ⚠️⚠️ **实测：后台化对这一步毫无收益，别做**（v1.7，probe_fillcost.py）。
+        #
+        # 我原以为「主线程被 108ms 堵住」=> 该上后台线程。量完发现前提是错的：
+        #   整链（裁块 6.4 + GDI+ 9.9 + 编码 30.1）同步 **49.0ms**，
+        #   搬后台线程 **48.9ms** —— **快 0%**。
+        # 原因：`bgra_to_ppm` 是「扩展切片赋值」，C 层 memcpy，**不释放 GIL**；
+        # `crop_bgra` 逐行切片同理。只有 GDI+（ctypes）那 9.9ms 释放 GIL，
+        # 而它只占整链的 20%。剩下 30.1ms 的编码 + 31.9ms 的
+        # `tk.PhotoImage`（Tk 只认主线程）**一个都搬不走**。
+        #
+        # 真正的 108ms 里另外 ~60ms 是 `tk.PhotoImage` + 贴图，
+        # 那部分必然在主线程。所以这一步的 ~95ms 是**物理下限**。
+        # 该修的是「别让别的回调在这时候炸出来」—— 见 `_on_wheel` 里
+        # `_zoom_hi` 那道拖动守卫，以及 `_prewarm_*` / `_base_prep_go`
+        # 的拖动让路（那两条加起来就是 260ms 里多出来的 110ms）。
+        """
+        self._later_ids.pop("panfill", None)
+        d = self._drag
+        if not d:
+            return                      # 已经松手了 —— 松手路径自己会补精确帧
+        col = d[0]
+        # ⚠️ 只在**真的会露白**时才去补块。拖动中绝大多数步都在缓冲内，
+        #   那些步不该付出「裁块 + 插值 + 编码」的成本。
+        info = self._view.get(col)
+        if not info:
+            return
+        self._pan_redraw_active = True
+        try:
             self.render_all(precise=0.75, only=col)
+        finally:
+            self._pan_redraw_active = False
+
+    def _tile_slack(self, col, cv):
+        """图元四边**离露白还差多少像素**（取最小的一边）。
+
+        > 0 = 还盖着（值就是余量）；<= 0 = 已经露白了。
+
+        ⚠️⚠️ **这是「要不要现在重画」的唯一判据**（v1.7 修抖动）。
+        原来判的是「盖没盖满」（`_tile_needs_more`），那**太晚了**：
+        块是「视口 + 一圈约 152px 的缓冲」，一帧挪 8px 就吃掉 8px 余量，
+        等到余量归零那一步，前面的帧全在白跑重画（实测 60 步里 59 步
+        都判「该重画」，每步 65~90ms = 掉 4~5 帧 —— 主人说的抖动）。
+
+        阈值取 `PAN_REDRAW_PX`（40px，缓冲的 1/4）：厚缓冲时重画纯属浪费，
+        而露白最早也在 40/8 = 5 步之后 —— 来得及。
+
+        ⚠️ 必须用**图元的真实 bbox**（`cv.bbox`），不能用「显示图尺寸 +
+        平移量」推算：分块之后画布上贴的只是视口那一块，比整张显示图小得多。
+        """
+        info = self._view.get(col)
+        if not info:
+            return -1
+        item = info.get("item")
+        if item is None:
+            return -1
+        bb = cv.bbox(item)
+        if not bb:
+            return -1                # 图元没了（被清过）-> 必须重取
+        cw = max(1, cv.winfo_width())
+        ch = max(1, cv.winfo_height())
+        # ⚠️⚠️⚠️ **必须扣掉「图的边界」**（v1.7 修向上拖抖动）。
+        #
+        # 视口可能比图**大**，或者拖到边缘时图的内容本来就到不了视口边缘
+        # —— 那不是露白，是**图的边**。原来直接
+        # `min(-bb[0], -bb[1], bb[2]-cw, bb[3]-ch)`，
+        # 于是拖到边缘时每一边的 slack 都是负数 -> **每步都判该重画**
+        # -> 实测向上拖 p50=49ms、63/123 步补块（水平方向只要 1.3~2.5ms，
+        # 因为它先撞左右边、上下还有余量）。主人反馈「向上拖最严重」。
+        #
+        # ⚠️⚠️ **图的边界怎么算**：图元只是「视口那一小块」，
+        # 它的左上角 bx 落在显示图**里面**，块起点是 `bx - ox`
+        #（`_view` 里 ox 是显示图原点、bx 是图元落点，v1.7 记过这个区别）。
+        # 所以整张显示图在画布上的范围是
+        #     `[bx - (bx-ox), ...] = [ox, ox+disp_w] x [oy, oy+disp_h]`
+        # —— 也就是 **`ox`/`oy` 那一套**（含 pan），不是 `bx + disp`。
+        # 我第一版写成 `bx + disp`，那是「小块起点 + 整张图宽」，
+        # 会算出几万 px 的边界，`max(...,0)` 之后判据恒等于 0，
+        # 于是**永不重画**（反向的错：真露白也抓不到）。两条都不对。
+        # ⚠️⚠️⚠️ **横向定长之后，`min(四边)` 会被恒定的横向余量顶住**
+        #（v1.7）。
+        #
+        # 横向块长恒定=> 横向余量**永远是常数**（实测 42px），
+        # 纵向余量才是在耗的那个。而 `min(l,t,r,b)` 取最小 ——
+        # 横向那个常数 42 正好最小，纵向掉到 -836 了它也不知道。
+        # 于是补块判据一直看到「还有 42px 缓冲」，实际早露白了。
+        #
+        # 正确口径：**纵向单独算，横向只在「图比视口小」时才参与**。
+        # 纵向块长跟视口走，所以纵向余量就是「缓冲还剩多少」，
+        # 直接用它判。
+        _vv = info.get("blk_fixed")
+        if _vv:
+            disp = info.get("disp") or (0, 0)
+            dw, dh = disp
+            oy0 = info.get("oy", 0)
+            ys = []
+            if oy0 > 0:
+                ys.append(-bb[1])
+            if oy0 + dh < ch:
+                ys.append(bb[3] - ch)
+            if ys:
+                return min(ys)
+            # 纵向两图都盖满视口 -> 横向才是可能露白的那一侧
+        ox = info.get("ox", 0)
+        oy = info.get("oy", 0)
+        disp = info.get("disp") or (0, 0)
+        dw = disp[0]
+        dh = disp[1]
+        # ⚠️⚠️⚠️ **定长块下，「离边缘多远」不再等于「还能撑多久」**
+        #（v1.7 修「上」方向每 8 步补一块）。
+        #
+        # 现在块长是**恒定**的（`视口 + 2*缓冲`，见 `_render_tile`），
+        # 于是横向余量恒定、纵向余量在变。而 `min(四边)` 会取到
+        # **恒定的那一边**（实测横向恒 42px、纵向从 149 一路掉到 -124），
+        # 于是 slack 看着还有 42、实际纵向早露白了 —— 判据被「顶住」，
+        # 一直拖到纵向真的不够才补。trace 实测：补块间隔正好等于网格步长
+        # （56px = 8 步），**比该有的 4~5 倍多**。
+        #
+        # 正确口径：**只算「会变的那几条边」**。
+        # 更稳的做法是直接问「有没有露白」，但那要算面积（贵）；
+        # 这里保留边差口径，但**按「块是否定长」分档**：
+        #   - 定长块：只有「图够不到视口」的那一边会露白，按那一侧算
+        #   - 滑动块：四边都算（那是v1.6 的老路径）
+        _fixed = None   # 块长恢复滑动后回到四边min口径
+        if _fixed:
+            # 定长块：横向恒定不看，只看纵向；纵向也恒定（上下都贴边）时
+            # 才退回四边min。
+            xs = []
+            if ox > 0:
+                xs.append(-bb[0])
+            if ox + dw < cw:
+                xs.append(bb[2] - cw)
+            ys = []
+            if oy > 0:
+                ys.append(-bb[1])
+            if oy + dh < ch:
+                ys.append(bb[3] - ch)
+            cand = (ys or xs or [-bb[0], -bb[1], bb[2] - cw, bb[3] - ch])
+            return min(cand)
+        l = -bb[0]                      # 图元四边盖住 / 超出视口多少
+        t = -bb[1]
+        r = bb[2] - cw
+        b = bb[3] - ch
+        # 图够不到视口的那一条，slack 按 0 算（不是负数 ——
+        # 图自己就那么大，不该无限重画）
+        if ox > 0:
+            l = max(l, 0)               # 图左沿在视口右边 -> 左边永远盖不住
+        if oy > 0:
+            t = max(t, 0)
+        if ox + dw < cw:
+            r = max(r, ox + dw - cw)    # 图右沿到不了视口右边 -> 以图边为准
+        if oy + dh < ch:
+            b = max(b, oy + dh - ch)
+        return min(l, t, r, b)
 
     def _tile_needs_more(self, col, cv, px, py):
         """平移之后，渲染好的那块还能不能盖住整个画布？（不够就得重取）
@@ -1740,6 +2452,12 @@ class App(tk.Tk):
 
     def _pan_end(self):
         self._drag = None
+        # ⚠️ 拖动中挂起的预热图，松手就补建（`_prewarm_done` 里攒着的）。
+        #   不排这一下的话，就只能等 `_prewarm_tick` 下一轮 —— 而它
+        #   头一句就是「拖动中让路」，这里 `_drag` 刚清空才轮得到，
+        #   中间白等 200ms。
+        if getattr(self, "_prewarm_hold", None):
+            self._later("prewarmflush", 30, self._prewarm_flush)
         # 松手后按最终位置补一帧精确的（顺便触发后台基准升级）
         for col in (0, 1):
             if self.zoom[col] > 1.001 and self._view.get(col):
@@ -1784,12 +2502,25 @@ class App(tk.Tk):
             self.cv_a.delete("all")
             if self.mode == "pair":
                 self.cv_b.delete("all")
-        self._render_side(0, self.cv_a, self.cap_a, self.path_a, self.rect_a,
-                          precise)
-        if only is None or only == 1:
-            if self.mode == "pair":
-                self._render_side(1, self.cv_b, self.cap_b, self.path_b,
-                                  self.rect_b, precise)
+        # ⚠️⚠️ **`only` 必须是「只画这一侧」，两侧都要判**（v1.7 修 195ms 卡顿）。
+        #
+        # 原来 side 0 是**无条件**画的，只有 side 1 才判 `only`：
+        #     self._render_side(0, ...)              # <- 永远画
+        #     if only is None or only == 1: ...     # <- 只有 side 1 判
+        # 于是 `render_all(only=1)`（**拖右图时补块走的就是这条**）
+        # 会把**左图也重画一遍** —— 而左图此刻的 zoom/pan 一点没变，
+        # 本该是缓存命中，实际却是「另一块没缓存的块」= 真编码 30ms
+        # + PhotoImage 32ms。实测补块帧 82ms -> 195.9ms，**多出来的
+        # 113ms 全是白花的**。
+        #
+        # 自证：`only=0` 走不到这里（side 0 画了），`only=1` 却画了两侧 ——
+        # 「只画一侧」这个语义被破坏了，注释写的也是「只重画某一侧」。
+        if only is None or only == 0:
+            self._render_side(0, self.cv_a, self.cap_a, self.path_a,
+                              self.rect_a, precise)
+        if (only is None or only == 1) and self.mode == "pair":
+            self._render_side(1, self.cv_b, self.cap_b, self.path_b,
+                              self.rect_b, precise)
 
     # ---- 异步出图（把最贵的「编码」挪出主线程）----------------------
     def _fit_async(self, col, path, key, w, h, bgra, want, radius,
@@ -1850,6 +2581,18 @@ class App(tk.Tk):
         """
         mine = self._fit_pend.get(col) == key
         cur = self.path_a if col == 0 else self.path_b
+        # ⚠️⚠️⚠️ **顺序反了会让下面那道过期检查整道失效**（v1.7 抖动根因二）。
+        #
+        # 原来先`pop(col, None)` 再 `get(col)` —— **pop 之后必然是 None**，
+        # 于是 `if st is not None and st != now` 永远走不进去，
+        # **每一次后台编码回来都同步精确重画一次**。
+        # 而拖动中 pan 每步都在变，本来这道门该把 99% 的过期帧丢掉。
+        #
+        # 埋点抓到：横拖 115 步里 `_fit_ready` 触发了 **35~38 次**重画，
+        # 每次 100~200ms（p95 从 2.5ms 冲到 177ms）—— 这就是主人说的
+        # 「拖拽抖动」的**另一半**（前半段是 `_pan_move` 判据）。
+        # 自证信号：`get` 在 `pop` 之后，值必然是 None，判据形同虚设。
+        st = self._fit_pend_state.get(col)
         if mine:
             self._fit_pend.pop(col, None)
             self._fit_pend_state.pop(col, None)
@@ -1857,9 +2600,13 @@ class App(tk.Tk):
             return                       # 过期结果，丢掉（用户已经点走/换了档）
         # 编码要一百多毫秒，回来时视图可能已经不是发起时那样了。这时候再同步
         # 重画一次就是白花钱 —— 直接丢掉，等去抖后的精确帧自己来画。
-        st = self._fit_pend_state.get(col)
         now = (round(self.zoom[col], 4), tuple(self.pan[col]))
         if st is not None and st != now:
+            return
+        # ⚠️⚠️ **正在拖动时一律不画**（v1.7）。拖动每一帧都要重画，
+        #   这时候插进来一次 100~200ms 的精确重画，用户看到的就是「顿一下」。
+        #   缓存已经 put 好了，松手（`_pan_end`）自然会用上精确帧。
+        if self._drag:
             return
         try:
             img = tk.PhotoImage(data=ppm, master=self)
@@ -1984,14 +2731,21 @@ class App(tk.Tk):
     # ---- 分块渲染（缩放不卡的关键）--------------------------------
     # Zoom 之后只把**屏幕上真正看得见的那块**交给 Tk。
     # 每往外留这么多（占可视区比例）的缓冲，拖动时就不必立刻重画。
-    # ⚠️ 0.30 时块面积是**视口的 3.4 倍**（(1+2×0.30)²，再乘上「视口比
-    #    显示图小」的那部分），zoom 2.44 那档实测 367 万像素、编码 152ms ——
-    #    清晰度够了但卡。0.15 约 1.7 倍，编码砍到四成。
-    # 实测（真实照片，3000×2000 拖动 40 步，零露白的前提下）：
-    #    0.15 → 最慢 121ms    0.10 → 100ms    0.08 → 91ms
-    # 取 0.10：每边留 150px 缓冲，快速甩鼠标也不露；0.08 只留 121px，
-    # 省下的 9ms 不值得赌一次露白。块面积约视口的 1.44 倍。
-    TILE_PAD = 0.10    # 每边留这么多缓冲，滑出去才补新块。
+    TILE_PAD = 0.16    # 每边留这么多缓冲，滑出去才补新块。
+    #
+    # ⚠️⚠️ **0.16 是实测扫出来的，不是拍脑袋**（v1.7，探针 probe_pan2.py，
+    # 3000×2000 真图、四方向拖 115 步、步长 8px）：
+    #   TILE_PAD   缓冲(横/竖)   竖向 p95    补块次数
+    #   0.10       151/ 75        96 ms13
+    #   **0.16**   242/121      **2.5ms**    12
+    #   0.22       333/1662.6 ms        13
+    #   0.30       454/227        2.8 ms        13
+    # 关键在 0.10 -> 0.16 这一步：**p95 掉了 19~38 倍**，补块次数反而略降。
+    # 原因不是「缓冲厚了就不补块」（周期由 pad 决定，次数基本不变），
+    # 而是**块变厚后 `pkey` 的复用率变了**：缓冲薄时每拖 8px 就跨过
+    # 网格边界换 key、每次都真编码（100ms+）；缓冲厚时连续好几步
+    # 落在同一格里 -> 缓存命中 -> 0.6~2ms。
+    # 再往上加只是白费内存和编码时间，收益已经饱和。
     #
     # ⚠️⚠️ **v1.6 曾有两个「块多大 / 放大多大」的阈值，现在都没了**
     #（`TILE_SYNC_PX = 2000000` 和 `TILE_GDIP_MIN = 1.16`）。
@@ -2011,6 +2765,35 @@ class App(tk.Tk):
     #    实测缓存命中的重画只要 **0.6~1.8ms**，20ms 已经很宽裕；
     #    真解不出的那一档走 `_fit_async` 异步，天然不阻塞。
     PAN_LAG = 0.02
+
+    # 拖动时「缓冲还剩多少像素就重画一块新的」（v1.7）。
+    # ⚠️⚠️ **别拿固定像素，必须跟着「该方向的缓冲」走**。
+    #
+    # 这里原本写死 `40`，注释里说「缓冲 152px，取 1/4」——
+    # 可**那 152 是横向的**（`视口宽 1515 * 0.10`）。竖向缓冲只有
+    # `视口高 757 * 0.10 = 75px`，40px 已经是它的一半：
+    #   slack 每 8px 掉 8 -> 掉到 44 就补，补完只回到 75/76，
+    #   再走 40px 又掉到 44 -> **每 40px 补一块，744px 路程补了 43 次**
+    #   （trace 实测：oy 每补一次只前进 40px，缓冲从来没回满）。
+    #   根因是**注释按一个方向算、代码用同一个数套两个方向**。
+    #
+    # 现在改成 `缓冲 * PAN_REDRAW_FRAC`，两维各自算 —— 竖向阈值
+    # 变成 75*0.35 ≈ 26px，走 50px 才补，次数降到 1/1.5。
+    #⚠️ 比例不能太大：阈值越接近缓冲，补完的缓冲越少，
+    #   快速甩动（每帧 10px+）会在两次补块之间露白。0.35 实测够。
+    PAN_REDRAW_FRAC = 0.35
+
+    def _pan_redraw_px(self, disp_w, disp_h, cw, ch):
+        """拖动补块阈值（像素），**两维取小的那个**。
+
+        ⚠️ 必须是两维里**更紧**的那一维：任一维露白画面就难看，
+        #   所以按小的那个决定补块时机。
+        """
+        _pad = max(8.0, min(disp_w, cw, disp_h, ch) * self.TILE_PAD)
+        return max(8, int(_pad * self.PAN_REDRAW_FRAC))
+
+    # 兼容旧引用（阈值固定 40px 的那版语义），仅作兜底下限
+    PAN_REDRAW_PX = 40
 
     def _render_tile(self, col, cv, cap, path, box, zoom, precise=True):
         """zoom>1：只渲染视口那一块。
@@ -2085,8 +2868,8 @@ class App(tk.Tk):
             got = self.big.peek_best(path, max(256, want), native)
             if got is None:
                 got = self.big.peek_any(path)      # 手上有哪一档就用哪一档
-            if got is None:
-                return False                        # 手上空的：交给精确帧
+            if not got:
+                return False                    # 手上空的：交给精确帧
             # ⚠️⚠️ **拿到的那一档必须真的够清楚**，否则滚轮/拖动全程是马赛克。
             #    `peek_best` 只给「不超过 want 的最大档」，而档位表**必然有缺口**
             #    （BASE_STEP=256，3000 宽的图有 2304 这一档吗？没有）——
@@ -2099,21 +2882,143 @@ class App(tk.Tk):
             #    再往上要最清晰的**：基准档越高块越大，编码越慢
             #    （2560 档的块 276 万像素 → 编码 130ms，滚轮中间三档实测
             #    94/130/120ms就是这么来的）。松手后的精确帧会去解最清晰那档。
+            # ⚠️⚠️⚠️ **升档必须走后台预热，不能同步解**（v1.7 修「滚轮卡」）。
+            #
+            # 原来这里还有一句「升到刚好够 need_side 那一档就够了，
+            # 别再往上要最清晰的」（2560 档块 276 万像素、编码 130ms）。
+            # 现在**连这一刀也不能同步做**：纯噪声图（测试里的最坏输入）
+            # 滚轮放大实测**最慢 116ms**、超了 100ms 门槛。解一档是几百
+            # 毫秒的 Python 层按行拷贝，**会占着 GIL 把主线程饿死**——
+            # 这正是 `_base_prep` 注释里写的同一件事，我在快档路径上
+            # 又犯了一次（2026-10-06）。
+            #
+            # 正确做法：**登记**「停手后要这一档」，这一帧先用粗档顶上。
+            # 主人看到的画面最多糊 170ms（`zoomhi` 防抖那一帧就换清晰的），
+            # 而滚轮全程不掉帧。清晰度一步没让——下一段的 `worst_fast
+            # <= 1.15` 断言还钉着欠采样，真糊了照样红。
             if max(got[0], got[1]) * 1.15 < need_side:
                 up = self.big.peek_base(path, need_side, native)
                 if up is not None and max(up[0], up[1]) > max(got[0], got[1]):
-                    got = up
+                    got = up                # 手上已有这一档，直接用
+                else:
+                    self._base_prep(col, path, need_side)   # 后台去解
         if not got:
             return False
         bw, bh, bbgra = got
 
+        # ⚠️⚠️ **缓冲按「这一帧会不会被连续平移」分档**（v1.7）。
+        #
+        # `precise=0.75` 现在有两个调用方，需求正好相反：
+        #   - **滚轮**（`_on_wheel`）：每一帧都是一个**新 zoom**，
+        #     `pkey` 必然 miss、必然真编码。缓冲越大 = 块越大 = 越慢。
+        #     而滚轮之后紧接着 170ms 就是精确帧，**根本不需要厚缓冲**。
+        #   - **拖动**（`_pan_move`）：同一批 zoom 反复平移，块只要够厚
+        #     就能命中缓存 —— 实测缓冲 0.10→0.16 让竖向 p95 从 96ms 掉到
+        #     2.5ms（38 倍）。
+        #
+        # 所以：拖动用厚缓冲，滚轮用薄缓冲。这样两条路都不牺牲 ——
+        # 纯噪声图滚轮放大最慢从 116ms 回到 100ms 内，而拖动的抖动
+        # 一点没回来（探针 probe_pan2.py 四向 p95 2.9~6.1ms）。
+        _pad_scale = 1.0 if self._pan_redraw_active else 0.55
+
         # 视口 ∪ 缓冲 -> 「显示图」坐标系里的矩形
-        padx = int(min(disp_w, cw) * self.TILE_PAD)
-        pady = int(min(disp_h, ch) * self.TILE_PAD)
-        vx0 = max(0, min(disp_w - 1, -ox - padx))
-        vy0 = max(0, min(disp_h - 1, -oy - pady))
-        vx1 = max(vx0 + 8, min(disp_w, cw - ox + padx))
-        vy1 = max(vy0 + 8, min(disp_h, ch - oy + pady))
+        #
+        # ⚠️⚠️⚠️ **顺序必须是「先把视口夹进图内，再往外扩缓冲」**
+        #（v1.7 修「向上拖抖动最严重」，主人 2026-10-06 反馈）。
+        #
+        # 原来直接算 `-oy-pady .. ch-oy+pady` 然后整体 clamp 到 `[0, disp]`：
+        #   `vx1 = max(vx0+8, min(disp_w, cw-ox+padx))`
+        # 拖到图的边缘时，上沿被夹到 0，**下沿也跟着被截到图的边界**，
+        # 于是块的高度 =「图剩下的那部分」< 视口高 —— 图元根本盖不满画布。
+        # 实测 zoom 4.81 向上拖：pan_y=-744 时块高 832（图元 757，刚好），
+        # 之后**每拖 8px 图元就矮 8px**，pan_y=-800 时图元只有 701
+        # （视口 757）-> 下沿露 56px、`slack=-56`。
+        #
+        # 后果比露白更糟：`_tile_slack` 每步都看到负数 -> **每步都判该重画**
+        # -> 实测向上拖 p50=49ms（其他方向 1.3~2.5ms）、63/123 步补块。
+        # 水平方向看着正常只是因为它先撞到左右边缘、上下还有余量。
+        #
+        # 正确做法：**视口那一段必须完整落在块内**（哪怕贴边），
+        # 缓冲只往「图还有余量的方向」扩。
+        padx = int(min(disp_w, cw) * self.TILE_PAD * _pad_scale)
+        pady = int(min(disp_h, ch) * self.TILE_PAD * _pad_scale)
+        # ⚠️⚠️⚠️ **块起点必须对齐到「固定网格」，否则缓存 key 每帧都变**
+        #（v1.7 抖动根因四：竖拖 115 步补 37~43 块、p95 115ms）。
+        #
+        # `pkey` 里含 `px0/py0`。原来 `py0 = int(vy0*sy)` **跟着 pan
+        # 一路滑**：每拖 8px，显示坐标进 8px -> `py0` 进 7 个基准像素
+        # -> **每 8px 就是一个全新 key** -> 每次都要真编码（100~200ms）。
+        # 埋点实测：`pan=0,56 -> 0,112 -> 0,168` 每 56px 出一块，
+        # 744px 路程补了 **37 块**（该是 7 块）——
+        # 块高 909、视口 757、重叠 152px，理论上只该补 744/152+2 = 7 次。
+        #
+        # 网格步长取**缓冲那一层**（`pady`）：块按网格铺，相邻两块必然
+        # 重叠 `2*pady`；而落在同一格里的所有 pan **共用同一个 key**，
+        # 第二次起就是缓存命中（实测 0.6~1.8ms）。
+        _stepx = max(8, padx)
+        _stepy = max(8, pady)
+        # ⚠️⚠️⚠️ **起点对齐网格 + 长度恒定，两头都要定**（v1.7）。
+        #
+        # 埋点抓到：拖动时那次 render_all 本身就要 108~113ms
+        #（四方向连扫都稳定复现），而 115 步里只有 12~15 步补块
+        # —— 说明**每一次补块都在真编码**，不是缓存命中。
+        #
+        # 贴边时必然 miss 的原因：
+        #   - 起点 max(0, _gridx) 在拖到图顶/图左时**恒为 0**，
+        #     起点不再由网格决定；
+        #   - 块长于是回到滑动值「视口尾 + 缓冲」，**每拖 8px 变 8px**，
+        #     blkH 跟着变 -> 缓存 key 每步都是新的 -> 每块都重新编码。
+        #
+        # 定长之后：贴边那一侧多出来的部分本来就在图外（画布上看不见），
+        # 不会露白；而 key 稳定下来，复用率回来了。
+        #
+        # ⚠️ 只定长、起点还滑动是不行的（我试过）：补块次数反而从 12
+        #   涨到 41 —— 块不随视口前移，slack 就一直判该补。**两头都要定。**
+        _gridx = int((-ox - padx) // _stepx) * _stepx
+        _gridy = int((-oy - pady) // _stepy) * _stepy
+        vx0 = max(0, _gridx)                     # 起点：网格对齐
+        vy0 = max(0, _gridy)
+        # ⚠️⚠️⚠️ **块长也要恒定，否则缓存永远不命中**（v1.7 最后一处）。
+        #
+        # 埋点抓到：拖动时补块那一次 render_all 本身要**108~113ms**
+        #（每方向连扫都复现），而115 步只有 12~15 步补块 —— 说明
+        # **每次补块都在真编码**，缓存一次都没命中。
+        #
+        # 原因：块长原来是滑动值 `视口尾 + 缓冲`，每拖 8px 就变 8px，
+        # `blkH` 跟着变 -> 缓存 key 每步都是新的。
+        # 定长之后 key 只随网格变，第二次起就是 0.6~2ms 的命中。
+        #
+        # ⚠️ 定长会让「块不再随视口前移」，所以**补块判据必须一起改成
+        #   「按网格周期触发」**（见 `_pan_move` 的 `_grid_due`），
+        #   否则 slack 一直判该补、补块次数会从 12涨到 41。
+        # ⚠️⚠️⚠️ **块长必须固定，否则缓存永远不命中；但「定长」只对横向**
+        #（v1.7 修抖动 + 修「补块偏多」，这两件事是一起解的）。
+        #
+        # 起因：拖动时补块那一次 render_all 本身要 **108~113ms**
+        #（每方向连扫都复现），而 115 步只有 12~15 步补块——说明
+        # **每次补块都在真编码**，缓存一次都没命中。原因是块长跟着
+        # 视口尾滑动，每拖 8px 变8px，`blkH` 变 -> 缓存 key 变。
+        #
+        # ⚠️⚠️ **我一开始把两维都定长，那是错的**（实测踩过）：
+        #   块不随视口前移 -> 纵向缓冲被消耗完却「不恢复」->
+        #   trace 显示补块后 slack 回到 42（横向恒定）而**纵向一路掉到
+        #   -836 从没回来** -> 每 ~48px 必补一次（「上」16 次 vs
+        #   其他方向 5~10）。
+        #
+        # ✅ 正确的分工：
+        #   · **横向定长**（`vx1 = vx0 + _nx`）—— 横向本来就不滑动
+        #     （块起点由网格定、长度也由网格定，两边一致才有缓存）
+        #   · **纵向跟视口**（`vy1 = ch - oy + pady`）—— 缓冲必须
+        #     跟着走，否则越拖越露白
+        _nx = cw + 2 * padx
+        vx1 = min(disp_w, vx0 + _nx)
+        vy1 = min(disp_h, ch - oy + pady)
+        # 但视口那一段（长度恒为 cw/ch）绝不能少 —— 万一视口比整张
+        # 显示图还大（极小图放大很轻），块至少要有视口那么长。
+        vx1 = max(vx1, min(cw - ox, disp_w))
+        vy1 = max(vy1, min(ch - oy, disp_h))
+        vx1 = max(vx1, vx0 + 8)
+        vy1 = max(vy1, vy0 + 8)
 
         # 映射到基准像素
         sx = bw / float(disp_w)
@@ -2154,6 +3059,18 @@ class App(tk.Tk):
                                "blk": (blkW, blkH),
                                # 同上：这一帧应有的图元尺寸（给 test_ui 当判据）
                                "want": (twant, thwant),
+                               # 块长是否恒定（_tile_slack 据此换口径）
+                               "blk_fixed": True,
+                               # 本帧块落在哪个网格（_pan_move 据此判断要不要补）
+                               "grid": (max(0, int((-ox - padx) // _stepx)),
+                                        max(0, int((-oy - pady) // _stepy))),
+                               # 本帧用的缓冲（_pan_move 判跨格必须用同一个，
+                               #  别自己再算一遍 min(...) * TILE_PAD * _pad_scale）
+                               "pad": (padx, pady),
+                               # 图元真实落点 = `ox + px0/sx`（**不是 ox**）
+                               # —— `_pan_move` 要靠它，见下面那段
+                               "bx": ox + int(round(px0 / sx)),
+                               "by": oy + int(round(py0 / sy)),
                                "img": img}
             self._render_caption(cap, path, disp_w)
             return True
@@ -2287,7 +3204,26 @@ class App(tk.Tk):
                            #    换基准档（`base` 变大），反推的 `want` 就对不上了
                            #    （实测假报 389px 误差，测试自己错了三轮）。
                            "want": (twant, thwant),
-                           "img": img}
+                               # 块长是否恒定（_tile_slack 据此换口径）
+                               "blk_fixed": True,
+                               # 本帧块落在哪个网格（_pan_move 据此判断要不要补）
+                               "grid": (max(0, int((-ox - padx) // _stepx)),
+                                        max(0, int((-oy - pady) // _stepy))),
+                               # 本帧用的缓冲（_pan_move 判跨格必须用同一个，
+                               #  别自己再算一遍 min(...) * TILE_PAD * _pad_scale）
+                               "pad": (padx, pady),
+                           "img": img,
+                           # ⚠️⚠️⚠️ **图元「自己的」落点**（v1.7 修抖动，
+                           #   主人 2026-10-06 报「拖拽有抖动」）。
+                           #   它是 `ox + px0/sx`，**不是 `ox`** ——
+                           #   `ox` 是整张显示图的原点，而分块之后贴上画布的
+                           #   只是视口那一小块，起点在显示图里面。
+                           #   `_pan_move` 必须按这个挪图元；拿 `ox` 当落点
+                           #   会让图元每步瞬移回显示图左上角（实测
+                           #   -1348 而不是 -151，露白 1044px）
+                           #   -> 每步都判「该重画」-> 每步 60~90ms = 抖动。
+                           "bx": ox + int(round(px0 / sx)),
+                           "by": oy + int(round(py0 / sy))}
         self._render_caption(cap, path, disp_w)
         if DEBUG:
             print("[分块] 侧%d %s zoom %.2f 显示 %dx%d 取块 %dx%d -> 画 %dx%d"
@@ -2375,8 +3311,16 @@ class App(tk.Tk):
         self._later("baseprep", 300, self._base_prep_go)
 
     def _base_prep_go(self):
-        """防抖到期，真的开始解 —— 用户还在动就再往后推。"""
-        if getattr(self, "_prewarm_pause", 0) > time.time():
+        """防抖到期，真的开始解 —— 用户还在动就再往后推。
+
+        ⚠️⚠️ **拖动中也要让路**（v1.7）。`big.base()` 里的解码是
+        Python 层按行拷贝，**占着 GIL**；它一跑，主线程的 `update()`
+        就会被拖长（实测拖动中一次 update 到 243ms，而同一次补块
+        自己只花 105ms —— 差额就来自这些后台解码）。
+        判据：慢与补块次数**无关**（把补块判据强制打开后 p95 不变），
+        只能是这两条 GIL 竞争的路。
+        """
+        if getattr(self, "_prewarm_pause", 0) > time.time() or self._drag:
             self._later("baseprep", 250, self._base_prep_go)
             return
         want = getattr(self, "_base_want", None)
@@ -2417,9 +3361,26 @@ class App(tk.Tk):
         self._prewarm_pause = time.time() + sec
 
     def _prewarm_tick(self):
-        """一次处理一张：**后台**解码 + 编码，回调里只建 Tk 图。"""
-        if getattr(self, "_prewarm_pause", 0) > time.time():
+        """一次处理一张：**后台**解码 + 编码，回调里只建 Tk 图。
+
+        ⚠️⚠️ **拖动中整个让路**（v1.7 修「上」方向帧间隔 259ms）。
+
+        这一步看着「全在后台」，其实**后台解码会占着 GIL**：
+        `winimg.load_pixels` / `big.base` 里的按行拷贝是 Python 层代码，
+        GIL 握在它手里时主线程的 `update()` 只能干等。实测拖动中
+        一次 `update()` 被拖到 243ms，而同一次 `_pan_fill` 自己只花 105ms。
+
+        ⚠️ 为什么 `_pump_queue` 那道让路挡不住：预热是 `after` 直接排的
+        `_prewarm_tick`，跟队列泵是两条独立的路。
+        """
+        if getattr(self, "_prewarm_pause", 0) > time.time() or self._drag:
             self.after(200, self._prewarm_tick)
+            return
+        # ⚠️ 上一步刚攒下的字节（拖动中挂起的），先在后台之外处理掉：
+        #   `_prewarm_flush` 一次只建一张太慢，而这里已经是空闲期了。
+        if getattr(self, "_prewarm_hold", None):
+            self._prewarm_flush()
+            self.after(16, self._prewarm_tick)
             return
         if self._prewarm_busy or not getattr(self, "_prewarm_q", None):
             return
@@ -2465,8 +3426,39 @@ class App(tk.Tk):
         threading.Thread(target=work, daemon=True).start()
 
     def _prewarm_done(self, out):
-        """后台那张回来了 —— 主线程只做「字节 -> Tk 图」这最后一步。"""
+        """后台那张回来了 —— 主线程只做「字节 -> Tk 图」这最后一步。
+
+        ⚠️⚠️ **拖动中必须整个让路**（v1.7 修「上」方向 update 243ms）。
+
+        埋点抓到的：`_pan_fill` 内部只花 105~114ms，可探针量到的帧间隔
+        是 **259.7ms** —— 差额 130ms 不在补块里，而在同一次 `update()`
+        的**别的回调**上。两个来源，都在这一条链上：
+
+          ① `_prewarm_done` 在**主线程** `tk.PhotoImage(data=ppm)`，
+             而预热的是**整张图**（`box` 口径 1500 级，不是分块），
+             单张 30~150ms（`_fit_async` 的注释里就记着「38 + 46ms」）。
+          ② 它前面那条 `self.big.base(...)` 在**后台线程**跑 GDI 解码 ——
+             解码那段是 Python 层按行拷贝，**占着 GIL**，主线程被抢。
+
+        判据自证：这不是「补块慢」。上表里 `_pan_fill` 105ms 对帧间隔
+        259ms，比例稳定在 2.2~2.5；而补块快的「右」方向帧间隔只有
+        116.6ms（`_pan_fill` 100ms）—— **差的就是预热那一张**。
+
+        ⚠️ 为什么 `_pump_queue` 的让路不够：它只挡住了「后台解码好的
+        回调队列」，而预热是 `after` 直接排的 `_prewarm_tick` /
+        `_prewarm_done`，走的是另一条路。
+        """
         self._prewarm_busy = False
+        # ⚠️ 拖动中：字节先攒着，松手再一起建图。
+        #   `put_photo` 是纯字典写、`_keep` 是 list append，都不碰 Tk，
+        #   放后台线程也安全 —— 但为了不引入新的线程假设，这里只把
+        #   **建 Tk 图**这一步推迟，缓存写入照常（后台线程本来就在跑，
+        #   字节已经是现成的）。
+        if self._drag:
+            self._prewarm_hold = list(out)
+            self._prewarm_busy = False
+            self.after(80, self._prewarm_flush)
+            return
         for pkey, ppm in out:
             try:
                 img = tk.PhotoImage(data=ppm, master=self)
@@ -2476,6 +3468,28 @@ class App(tk.Tk):
             self._keep.append(img)
         if getattr(self, "_prewarm_q", None):
             # 每 60ms 才做一张，中间留出空闲，界面不会被拖慢
+            self.after(60, self._prewarm_tick)
+
+    def _prewarm_flush(self):
+        """拖动结束了 —— 把攒着的预热图建出来。
+
+        ⚠️ **一次只建一张**，剩下的下轮再建：一次全建会 100~300ms
+        糊在松手后的第一帧上，用户刚松手就看到「顿一下」以为没跟上。
+        """
+        held = getattr(self, "_prewarm_hold", None)
+        if not held or self._drag:
+            return
+        self._prewarm_hold = None
+        pkey, ppm = held[0]
+        try:
+            self.big.put_photo(pkey, tk.PhotoImage(data=ppm, master=self))
+            self._keep.append(self.big.photo(pkey))
+        except Exception:
+            pass
+        if len(held) > 1:
+            self._prewarm_hold = held[1:]
+            self.after(16, self._prewarm_flush)
+        elif getattr(self, "_prewarm_q", None):
             self.after(60, self._prewarm_tick)
 
     def _render_caption(self, cap, path, disp_w, crop_info=None):
@@ -2604,7 +3618,11 @@ class App(tk.Tk):
         item = cv.create_image(ox, oy, anchor="nw", image=img)
         # ox/oy 是**画那一刻**的位置，px/py 是**那一刻**的平移量。
         # 拖动时只需要在这个基础上加平移的增量，不用重算居中。
+        # ⚠️ `bx/by` = 图元真实落点。整张贴图时它**恰好等于** ox/oy，
+        #    但分块那条路径不是（那是 `ox + px0/sx`）—— `_pan_move`
+        #    只认 `bx/by`，见 `_view` 赋值处那段注释。
         self._view[col] = {"cv": cv, "item": item, "ox": ox, "oy": oy,
+                           "bx": ox, "by": oy,
                            "px": self.pan[col][0], "py": self.pan[col][1],
                            "disp": (dw, dh), "img": img}
 
@@ -2699,6 +3717,11 @@ class App(tk.Tk):
         实测：卡片在 162 / 186 之间来回跳，画布 757 / 733 来回跳，
         于是同一张图在缓存里躺着两份（720 和 736），每次选一组都未命中、
         都要后台重编码一遍。钉住之后画布尺寸恒定，缓存才真的命中。
+
+        ⚠️ v1.7：**曾经这里还为 NIQE 多留了一行**，那才是卡片在
+        162/186 之间跳的另一半原因（NIQE 算完才拼上去、长度变了就多
+        折一行）。现在「清晰度」拆成独立一行了，算完前后行数不变，
+        预留行已删 —— 钉住机制本身仍然留着（文件名/目录那两行还是会折）。
         """
         self.info_card.fit_to_content()
         # ⚠️ 用**内容本身**的高度（req_height），不是 `cget("height")`：
@@ -2710,16 +3733,16 @@ class App(tk.Tk):
                   % (self.info_card.body.winfo_reqheight(),
                      self.info_card.min_h, h, self._info_min_h),
                   file=sys.stderr)
-        # ⚠️ 「清晰度（NIQE）」那半句是**后台**算的，算完才往信息行里拼
-        #    （"分辨率 … · 质量 高清 · 清晰度 NIQE 3.21（良好）"），拼完更长，
-        #    很容易多折一行 -> 卡片 162 长到 186 -> 下面预览画布 757 缩到 733
-        #    -> 解码尺寸变 -> 成品图缓存整批作废（实测每次选一组都要重编码一遍）。
-        #    所以只要**当前显示的图还有 NIQE 没算完**，就先多留一行，
-        #    让卡片从第一帧起就是最终高度，布局不再抖。
-        for _col, got in self._niqe_lbl.items():
-            if got and self.niqec.cached(got[0]) is None:
-                h += int(self.f_small.metrics("linespace"))
-                break
+        # ⚠️ v1.7：**曾经**在这里为「NIQE 那半句」盲留一行高度
+        #（`if self.niqec.cached(...) is None: h += linespace`）。
+        # 那是主人截图里「下面还有一块空位」的来源 —— 留的那行在 NIQE
+        # 算完之前**一直是空的**（实测 min_h=186 而内容只要 130px，
+        # 白占 56px，等于把预览画布压小 56px）。
+        #
+        # 现在不需要预留了：清晰度已经**拆成独立一行**（见 `_fill_info_impl`），
+        # 算完前后那一行的**行数不变**，所以高度从第一帧起就是最终值 ——
+        # 而 `_fit_card` 存在的全部理由（别让卡片高度跳、进而让画布尺寸
+        # 变、进而让解码缓存 key 变）也就自动满足了。
         if h > self._info_min_h:
             self._info_min_h = h
         self.info_card.min_h = self._info_min_h
@@ -2764,35 +3787,48 @@ class App(tk.Tk):
             head = tk.Frame(box, bg=P.CARD)
             head.pack(fill="x")
             tk.Label(head, text=short_name(m["name"], 42), bg=P.CARD,
-                     fg=P.TEXT, font=self.f_h2, anchor="w").pack(side="left")
+                     fg=P.TEXT, font=self.f_h2, anchor="w").pack(
+                         side="left", fill="x", expand=True)
             if q[0] in ("poor", "fair"):
                 tk.Label(head, text="  " + q[1], bg=P.CARD,
                          fg=P.POOR if q[0] == "poor" else P.TEXT_3,
                          font=self.f_tiny).pack(side="left")
 
-            # 「分辨率 · 格式 · 大小 · 时间 · 质量 · 清晰度」合并成一行。
-            # NIQE 是后台异步算的：先渲染不带它的整行文本（`base`），
-            # 算完由 _niqe_done 把「NIQE 那段」拼回去 —— 所以要把 base 留着。
+            # ⚠️⚠️ **清晰度（NIQE）放标题行右侧，不另起一行**（v1.7）。
+            #
+            # 这里换过两次位置，每次都是被截图逼的（主人 2026-10-06
+            # 「NIQE 由于长度显示不出数据，看得到下面还有点空位」）：
+            #   ① 原来拼在信息行末尾 + `_fit_card` 盲留一行高度
+            #      → NIQE 算完前那半句和那行**都是空的**（截图就是这样）。
+            #   ② 改成独立一行、删掉预留 → 空位没了，但**卡片反而高了 6px**
+            #      （实测 186 -> 192，因为多了一整行 Label 的 30px，
+            #      比省下的 24px 预留还多 6）—— 跟「适当调整」反着来。
+            #   ③ 现在放进标题行右侧：那一行右边本来就是空的
+            #      （只有文件名 + 可选的质量徽章），**一行都不多占**，
+            #      预留也就不需要了（算完前后行数不变 -> 卡片高度恒定
+            #      -> 画布尺寸恒定 -> 解码缓存 key 不变，见 `_fit_card`）。
+            #
+            # `wraplength=0` = **不折行**：宁可右边被裁掉一点，
+            # 也不能让高度跳 —— 高度一跳，下面画布就变，缓存整批作废。
+            nq = self.niqec.cached(path)
+            lbl2 = tk.Label(head, text=niqe_field(path, nq),
+                            bg=P.CARD, fg=P.TEXT_3, font=self.f_small,
+                            anchor="e", justify="right", wraplength=0)
+            lbl2.pack(side="right")
+            self._niqe_lbl[col] = (path, lbl2)
+            if nq is None:
+                self.niqec.request(path,
+                                   lambda p, res, c=col: self._niqe_done(c, p, res))
+
             f1 = ["分辨率 %s" % (("%d × %d（%.1f MP）"
                                   % (wh[0], wh[1], imgsize.megapixels(wh)))
                                  if wh else "解析不了（%s）" % m["format"]),
                   "%s · %s" % (m["format"], human_size(m["size"])),
                   human_time(m["mtime"]),
                   "质量 %s" % q[1]]
-            base = " · ".join(f1)
-            nq = self.niqec.cached(path)
-            lbl2 = tk.Label(box,
-                            text=base if nq is None else
-                            "%s · %s" % (base, niqe_field(path, nq)),
-                            bg=P.CARD, fg=P.TEXT_2,
-                            font=self.f_small, anchor="w", justify="left",
-                            wraplength=S(780))
-            lbl2.pack(fill="x")
-            # 回填时要用到「质量」那半句和整行模板，一起记下来
-            self._niqe_lbl[col] = (path, lbl2, q[1], base)
-            if nq is None:
-                self.niqec.request(path,
-                                   lambda p, res, c=col: self._niqe_done(c, p, res))
+            tk.Label(box, text=" · ".join(f1), bg=P.CARD, fg=P.TEXT_2,
+                     font=self.f_small, anchor="w", justify="left",
+                     wraplength=S(780)).pack(fill="x")
             tk.Label(box, text=m["dir"], bg=P.CARD, fg=P.TEXT_3,
                      font=self.f_tiny, anchor="w", justify="left",
                      wraplength=S(440)).pack(fill="x")
@@ -2802,17 +3838,18 @@ class App(tk.Tk):
 
         只在「这一侧还是当时那张图」时才动它 —— 用户可能已经点到别的图上了，
         那时候旧结果必须丢掉，否则会张冠李戴。
-        行合并后这一行还背着「分辨率 · 格式 · 大小 · 时间 · 质量」，
-        所以要拿存下来的整行模板把文本**整体**重写。
+
+        ⚠️ **只改「清晰度」那一行**（v1.7：它已经拆成独立 Label 了）。
+        原来它是拼在信息行末尾的，回填得拿整行模板重写一遍 —— 现在不用了。
         """
         got = self._niqe_lbl.get(col)
         if not got or got[0] != path:
             return
-        _path, lbl, _quality, base = got
+        _path, lbl = got
         try:
             if not lbl.winfo_exists():
                 return
-            lbl.configure(text="%s · %s" % (base, niqe_field(path, res)))
+            lbl.configure(text=niqe_field(path, res))
         except tk.TclError:
             pass
 
@@ -2935,23 +3972,57 @@ class App(tk.Tk):
         plan = quarantine.plan_exact_dups(groups)
         total_drop = sum(len(d) for _, d, _ in plan)
         freed = sum(f for _, _, f in plan)
+        # ⚠️⚠️ **每组必须编号**（主人 2026-10-06：「显示哪一组，名字不好找」）。
+        #
+        # 原来 6 组直接罗列、文件名截断到 24~30 字（`v2-cc86d05542d9…4aef5846_r`
+        # 这种哈希名截完几乎全一样），用户根本没法跟屏幕上的内容对上，
+        # 想反悔只能全盘接受或全盘拒绝。
+        # 编号之后用户能直接说「第 3 组那两个别动」——虽然现在还不能
+        # 单独勾选，但至少能定位、能跟别人说清楚。
+        #
+        # 顺带把「保留/移走」的对齐做掉：用固定宽度前缀，文件名长短不一时
+        # 也能一眼看出是同一组的。
+        _KEEP_W = 46
         lines = []
-        for keep, drop, _f in plan[:10]:
+        multi_dir = False
+        for gi, (keep, drop, _f) in enumerate(plan, 1):
             m = META.of(keep)
             wh = m["wh"]
-            lines.append("保留 %s%s\n   移走 %s" % (
-                short_name(m["name"], 30),
-                ("（%d × %d）" % wh) if wh else "",
-                "、".join(short_name(os.path.basename(p), 24) for p in drop)))
+            # ⚠️ 同一组可能来自**不同文件夹**（扫描了多个目录时）。
+            #    只给文件名的话，用户看到两个同名文件根本分不清是哪个 ——
+            #    那正是「名字不好找」的另一半。
+            dirs = set(os.path.dirname(p) for p in [keep] + list(drop))
+            if len(dirs) > 1:
+                multi_dir = True
+            lines.append("【第 %d 组】共 %d 张 · 省 %s" % (
+                gi, len(drop) + 1, human_size(_f)))
+            lines.append("  保留  %s%s" % (
+                short_name(m["name"], _KEEP_W),
+                ("（%d × %d）" % wh) if wh else ""))
+            for p in drop:
+                _bn = short_name(os.path.basename(p), _KEEP_W)
+                _dn = ""
+                if len(dirs) > 1:
+                    # 只标所在文件夹的**最后一级**，够区分又不至于太长
+                    _dn = "  ← %s" % short_name(
+                        os.path.basename(os.path.dirname(p)) or
+                        os.path.dirname(p), 18)
+                lines.append("  移走  %s%s" % (_bn, _dn))
+            if gi < len(plan):
+                lines.append("")
         if len(plan) > 10:
-            lines.append("……还有 %d 组" % (len(plan) - 10))
+            lines.append("（只列了前 10 组，共 %d 组）" % len(plan))
+        _hint = ("\n\n同名文件分属不同文件夹，已在右边标出所在目录。"
+                 if multi_dir else "")
         ok = messagebox.askyesno(
             "清理完全重复的图片",
             "找到 %d 组**内容完全相同**的图（文件哈希一致，100%% 相同），"
-            "共可移走 %d 张、省出 %s。\n\n每组保留分辨率最高 / 文件最大的那张：\n\n%s\n\n"
+            "共可移走 %d 张、省出 %s。\n\n"
+            "每组保留分辨率最高 / 文件最大的那张，**其余移到隔离夹**"
+            "（每组编号，报「第几组」就能定位）：\n\n%s%s\n\n"
             "被移走的会进各自的「%s」隔离夹（移动，不是删除）。继续吗？"
             % (len(plan), total_drop, human_size(freed), "\n".join(lines),
-               quarantine.QUARANTINE_NAME),
+               _hint, quarantine.QUARANTINE_NAME),
             icon="warning", default="no")
         if not ok:
             self.stat.configure(text="已取消清理")
@@ -3037,6 +4108,8 @@ class App(tk.Tk):
 
 
 # ---------------------------------------------------------------------------
+
+
 
 def main(argv):
     uikit.enable_dpi_awareness()      # 必须在建窗口之前
