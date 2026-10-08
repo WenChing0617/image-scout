@@ -105,12 +105,14 @@ def main():
         pump(app, 0.6)
 
     # ---- v1.12：信息卡排版（分辨率+大小放大、独立一行） -----------------
+    # ---- v1.13：画布下方那条 cap 不上了（画布一直延伸到信息卡） ---------
     # ⚠️ 信息卡只在看图（pair / 单图）下才填内容，扫描列表模式是空的。
     fs = list(app.files)[:2]
     if len(fs) >= 2:
         app.set_pair(fs[0], fs[1])
         pump(app, 4.0)                     # 等首帧 + NIQE 那行填完
         app.update_idletasks()
+        shot("9-pair")                     # 整窗：看画布下方有没有那条小字
         w, h = uishot.grab_widget(app, app.info_card,
                                   "%s-8-info.png" % prefix,
                                   margin=uikit.sc(6))
