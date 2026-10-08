@@ -879,8 +879,8 @@ class App(tk.Tk):
             ("双击左栏", "换主图 / 打开这一张"),
         ]
         funcs = [
-            ("添加文件夹", "选一个目录来查重（可以加多个）"),
-            ("添加图片", "直接挑几张图丢进来"),
+            ("添加文件夹", "选一个目录来查重（再选一个 = 换掉上一个）"),
+            ("添加图片", "挑几张图丢进来（同样换掉上一次的）"),
             ("含子文件夹", "连子目录一起扫"),
             ("灵敏度", "严格 / 标准 / 宽松，越严越少误报"),
             ("相似分组", "张数多的在前；同数量比质量、再比组号"),
@@ -1408,11 +1408,34 @@ class App(tk.Tk):
     # ------------------------------------------------------------------
     # 来源 / 扫描
     # ------------------------------------------------------------------
+    def _replace_roots(self, new):
+        """把「本次要扫的来源」整个换成 `new` —— 是**换**，不是**再加一个**。
+
+        主人 2026-10-08：「重新添加文件夹的时候，要将上次添加的自动清除，
+        不然每次添加文件夹会越来越多，所以每次只要扫描本次的文件夹就行了。」
+
+        所以「添加文件夹 / 添加图片」这两个按钮的语义是**替换**：
+        先把上一次的根连同上一轮的扫描结果一起清掉，再放进这一次选的东西。
+        老写法是 `self.roots.append(...)`，点三次就攒成三个目录**叠加**扫，
+        扫出来的到底覆盖了哪儿，界面上一个字都看不出来。
+
+        ⚠️ 调用方必须已经确认「用户真的选了东西」（取消对话框不许走到这里）——
+           否则点一下「取消」就把主人辛苦扫出来的结果清没了。
+        ⚠️ 撤销栈（`undo_stack`）**故意不清**：它记的是「哪几张图被搬进了
+           隔离夹」，那是磁盘上真实发生过的事，跟「这回换扫哪个目录」无关。
+           顺手清掉就等于让主人撤不回刚移走的图。
+        """
+        new = [os.path.abspath(p) for p in new]
+        # `clear_all()` 会把 `self.roots` 也清空，所以赋值必须排在它后面。
+        self.clear_all()
+        self.roots = new
+        self._refresh_roots()
+
     def add_folder(self):
         d = filedialog.askdirectory(title="选择要扫描的文件夹")
-        if d:
-            self.roots.append(os.path.abspath(d))
-            self._refresh_roots()
+        if not d:
+            return                  # 点了取消：什么都不动（别把上一轮结果清了）
+        self._replace_roots([d])
 
     def add_files(self):
         fs = filedialog.askopenfilenames(
@@ -1420,10 +1443,9 @@ class App(tk.Tk):
             filetypes=[("图片", "*.jpg *.jpeg *.png *.gif *.bmp *.webp "
                         "*.tif *.tiff *.heic *.avif *.ico *.jxl"),
                        ("所有文件", "*.*")])
-        if fs:
-            for f in fs:
-                self.roots.append(os.path.abspath(f))
-            self._refresh_roots()
+        if not fs:
+            return                  # 同上：取消不动
+        self._replace_roots(fs)
 
     def clear_all(self):
         self.roots = []
