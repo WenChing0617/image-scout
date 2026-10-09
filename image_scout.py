@@ -227,9 +227,38 @@ class NiqeCache:
         self._c = {}                       # path -> (mtime, (score, note))
         self._cb = {}                      # path -> [回调]
         self._busy = set()
+        self._cancel = set()               # 让路：这几张先别算了（见 cancel()）
         self._q = queue.Queue()
         self._lock = threading.Lock()
         threading.Thread(target=self._loop, daemon=True).start()
+
+    def cancel(self, paths):
+        """让后台**先别算这几张** —— 删图之前叫的。
+
+        ⚠️ 为什么删图要管 NIQE：`niqe_score` 走 `winimg.load_pixels_exact`
+           （GDI+ `GdipCreateBitmapFromFile`），**在这三条后台读盘的路里
+           持句柄最久**（要等解码 + 高质量缩放整个做完才 Dispose）。
+           主人手一快连删，正好撞上「它还在解这张、你要移走这张」，
+           `shutil.move` 就报 WinError 32（见 `quarantine.isolate` 顶部那段）。
+
+        ⚠️ 只是「别**开始**算」，**已经开跑的那一张拦不住**（句柄在 GDI+ 手里）
+           —— 那部分由 `quarantine.isolate` 的重试兜底。
+        ⚠️ 不缓存任何结果：被取消的图多半马上就要被移走了，算出来也是白算；
+           万一没移成，下次 `request()` 会把它从 `_cancel` 里摘掉重算。
+        """
+        paths = {p for p in (paths or ()) if p}
+        if not paths:
+            return
+        with self._lock:
+            for p in paths:
+                self._cancel.add(p)
+                self._busy.discard(p)
+            if len(self._cancel) > 400:
+                # 被让路之后又没被请求过的路径会一直躺着（比如删成功了）。
+                # 它是纯字符串集合，留着也不会出错，但别让它无限涨。
+                self._cancel.clear()
+        for p in paths:
+            self._fire(p, (None, "已跳过（正要移走它）"))
 
     def cached(self, path):
         with self._lock:
@@ -246,6 +275,12 @@ class NiqeCache:
         """排队算；`on_done(path, (score, note))` 会在**主线程**被调用。"""
         if not path:
             return None
+        with self._lock:
+            # ⚠️ 再次被请求 = 这张图还在（多半是上次「让路」了但没移成）。
+            #    必须把让路标记摘掉，否则它永远算不出来、卡片一直停在
+            #    「清晰度 计算中…」。**这一步要放在 `cached()` 早退之前**，
+            #    不然命中缓存时标记就留着了。
+            self._cancel.discard(path)
         got = self.cached(path)
         if got is not None:
             self.to_ui(on_done, path, got)          # 已有结果，直接回调
@@ -266,6 +301,13 @@ class NiqeCache:
     def _loop(self):
         while True:
             path = self._q.get()
+            with self._lock:
+                if path in self._cancel:
+                    # ⚠️ 这里**要**把标记摘掉：它是「这一轮先别算」的意思，
+                    #    不是永久拉黑。留着的话下次 request 也永远算不出来。
+                    self._cancel.discard(path)
+                    self._busy.discard(path)
+                    continue
             try:
                 res = niqe_score(path)
             except Exception as e:                  # 线程里绝不能抛出去
@@ -4977,6 +5019,40 @@ class App(tk.Tk):
         if n:
             self._toast("已移入隔离夹 · 想还原就把它拖回原目录")
 
+    def _quiesce_for(self, paths):
+        """要移走这几个文件之前，先让**本程序自己**别再碰它们。
+
+        ⚠️⚠️ 主人 2026-10-08 报的「删除过快就弹『移动失败』」就是这么来的：
+           Windows 上只要本程序还有线程拿着文件句柄，`shutil.move` 立刻报
+           `PermissionError: [WinError 32] 另一个程序正在使用此文件`。
+           而这里有**三条后台线程**会在用户手快时正好在解同一张图 ——
+
+             * `_prewarm_tick`   预热「下一个会看到的图」
+             * `_base_prep_go`   后台解「基准像素」（`BigCache.base`）
+             * NIQE 线程         走 GDI+ 打开文件，**持句柄最久**
+
+           所以动手前先把它们从待办里摘掉、暂停一会儿预热、叫停 NIQE。
+
+        ⚠️ **已经开跑的那一张拦不住**（句柄已经在 GDI+ / Shell 手里了），
+           那部分只能靠 `quarantine.isolate` 的重试兜底。**两条一起上**
+           才治得住：这里把「即将要删的」提前撤下来（治本），
+           那边等几十毫秒再试一次（兜底）。
+        """
+        drop = {p for p in (paths or ()) if p}
+        if not drop:
+            return
+        self._prewarm_q = [p for p in (getattr(self, "_prewarm_q", None) or [])
+                           if p not in drop]
+        want = getattr(self, "_base_want", None)
+        if want:
+            for k in [k for k in want if k[0] in drop]:
+                want.pop(k, None)
+        self._prewarm_yield(0.9)
+        try:
+            self.niqec.cancel(drop)
+        except Exception:
+            pass
+
     def delete_paths(self, paths, label=None):
         """把一批图移进隔离夹，并把它们从所有内存结构里摘干净。
 
@@ -4986,6 +5062,8 @@ class App(tk.Tk):
         paths = [p for p in dict.fromkeys(paths) if p and os.path.isfile(p)]
         if not paths:
             return 0
+        # ⚠️ **必须在 isolate_many 之前**：先让本程序自己松手（见 `_quiesce_for`）
+        self._quiesce_for(paths)
         done, failed = quarantine.isolate_many(
             paths, self.roots,
             on_progress=lambda d, t: self._progress(0.6 * d / max(1, t),
